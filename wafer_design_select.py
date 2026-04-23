@@ -148,57 +148,127 @@ def _fast_read_xlsx(filepath):
     return raw, sheet_name
 
 
+def _read_text_map(filepath):
+    """Read a text wafer map. Supports either:
+      - raw grid text (one row per line), or
+      - wrapped wafer-map files containing MAP = { ... }
+    Returns (raw, sheet_name, meta) where raw is list[list[str]].
+    meta stores wrapper/header/footer info for round-trip txt export.
+    """
+    with open(filepath, 'r', encoding='utf-8-sig', errors='replace') as f:
+        lines = f.read().splitlines()
+
+    start_idx = None
+    end_idx = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith('MAP') and '{' in line:
+            start_idx = i
+            break
+
+    if start_idx is not None:
+        for j in range(start_idx + 1, len(lines)):
+            if lines[j].strip() == '}':
+                end_idx = j
+                break
+
+    if start_idx is not None and end_idx is not None and end_idx > start_idx:
+        map_lines = lines[start_idx + 1:end_idx]
+        prefix_lines = lines[:start_idx + 1]
+        suffix_lines = lines[end_idx:]
+        sheet_name = 'MAP'
+    else:
+        map_lines = lines
+        prefix_lines = []
+        suffix_lines = []
+        sheet_name = os.path.splitext(os.path.basename(filepath))[0]
+
+    map_lines = [ln.rstrip('\r\n') for ln in map_lines if ln.strip() != '']
+    width = max((len(ln) for ln in map_lines), default=0)
+    raw = [list(ln.ljust(width)) for ln in map_lines]
+
+    meta = {
+        'type': 'txt',
+        'prefix_lines': prefix_lines,
+        'suffix_lines': suffix_lines,
+        'had_wrapper': bool(prefix_lines or suffix_lines),
+    }
+    return raw, sheet_name, meta
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  UNIVERSAL FORMAT DETECTOR + PARSER
 # ═══════════════════════════════════════════════════════════════════════
 def detect_and_parse(filepath):
     """
-    Opens an xlsx file, auto-detects its format, and returns:
+    Opens an xlsx/xls/txt wafer map, auto-detects its format, and returns:
       grid        : list[list]  — normalised grid (null='.', edge='X', design=str)
       designs     : list[str]   — sorted unique design IDs
       counts      : dict        — {design: die_count}
       sheet_name  : str
-      fmt         : 'A' | 'B' | 'C'
+      fmt         : 'A' | 'B' | 'C' | 'TXT'
       null_char   : str         — original null character found in file
+      source_kind : str         — 'xlsx' or 'txt'
+      meta        : dict        — optional source metadata for export
     """
-    raw, sheet_name = _fast_read_xlsx(filepath)
+    ext = os.path.splitext(filepath)[1].lower()
+    source_kind = 'txt' if ext == '.txt' else 'xlsx'
+    meta = {'type': source_kind}
 
-    # ── detect format ────────────────────────────────────────────────────
-    # Sample up to 5000 non-None values for format detection
-    sample = []
-    for row in raw:
-        for c in row:
-            if c is not None:
-                sample.append(c)
+    if source_kind == 'txt':
+        raw, sheet_name, meta = _read_text_map(filepath)
+
+        non_null = [c for row in raw for c in row if c not in (None, '')]
+        val_counts = Counter(non_null)
+        if val_counts.get('*', 0) > 0:
+            edge_chars = {'*', 'X'}
+            null_chars = {'.', ' '}
+            null_char = '.'
+        elif val_counts.get('-', 0) > 100:
+            edge_chars = {'X'}
+            null_chars = {'-', ' '}
+            null_char = '-'
+        else:
+            edge_chars = {'X'}
+            null_chars = {'.', ' '}
+            null_char = '.'
+
+        grid = _normalise_grid(raw, null_chars=null_chars, edge_chars=edge_chars)
+        fmt = 'TXT'
+    else:
+        raw, sheet_name = _fast_read_xlsx(filepath)
+
+        sample = []
+        for row in raw:
+            for c in row:
+                if c is not None:
+                    sample.append(c)
+                if len(sample) >= 5000:
+                    break
             if len(sample) >= 5000:
                 break
-        if len(sample) >= 5000:
-            break
 
-    val_counts = Counter(sample)
+        val_counts = Counter(sample)
 
-    has_rowdata   = val_counts.get('RowData:', 0) > 10 or \
-                    any(str(v).startswith('RowData:') for v in sample[:50])
-    has_dash_null = val_counts.get('-', 0) > 100
+        has_rowdata   = val_counts.get('RowData:', 0) > 10 or \
+                        any(str(v).startswith('RowData:') for v in sample[:50])
+        has_dash_null = val_counts.get('-', 0) > 100
 
-    if has_rowdata:
-        fmt = 'C'
-    elif has_dash_null:
-        fmt = 'B'
-    else:
-        fmt = 'A'
+        if has_rowdata:
+            fmt = 'C'
+        elif has_dash_null:
+            fmt = 'B'
+        else:
+            fmt = 'A'
 
-    # ── parse into normalised grid ───────────────────────────────────────
-    if fmt == 'C':
-        grid, null_char = _parse_format_c(raw)
-    elif fmt == 'B':
-        grid = _normalise_grid(raw, null_chars={'-'}, edge_chars={'X'})
-        null_char = '-'
-    else:
-        grid = _normalise_grid(raw, null_chars={'.', None}, edge_chars={'X'})
-        null_char = '.'
+        if fmt == 'C':
+            grid, null_char = _parse_format_c(raw)
+        elif fmt == 'B':
+            grid = _normalise_grid(raw, null_chars={'-'}, edge_chars={'X'})
+            null_char = '-'
+        else:
+            grid = _normalise_grid(raw, null_chars={'.', None}, edge_chars={'X'})
+            null_char = '.'
 
-    # ── collect designs ──────────────────────────────────────────────────
     counts = Counter()
     for row in grid:
         for cell in row:
@@ -207,7 +277,7 @@ def detect_and_parse(filepath):
 
     designs = _sort_designs(list(counts.keys()))
 
-    return grid, designs, dict(counts), sheet_name, fmt, null_char
+    return grid, designs, dict(counts), sheet_name, fmt, null_char, source_kind, meta
 
 
 def _normalise_grid(raw, null_chars, edge_chars):
@@ -283,6 +353,8 @@ class WaferMapTool(tk.Tk):
         self.source_sheet     = None
         self.file_fmt         = None
         self.null_char        = '.'
+        self.source_kind      = 'xlsx'
+        self.source_meta      = {}
         self.grid_data        = []
         self.enc              = None
         self.designs          = []
@@ -657,7 +729,7 @@ class WaferMapTool(tk.Tk):
     def _open_file(self):
         path = filedialog.askopenfilename(
             title="Open Wafer Map",
-            filetypes=[("Excel files","*.xlsx *.xls"),("All files","*.*")])
+            filetypes=[("Wafer map files","*.xlsx *.xls *.txt"),("Excel files","*.xlsx *.xls"),("Text files","*.txt"),("All files","*.*")])
         if not path: return
         self.filepath = path
         self.breadcrumb.config(text=os.path.basename(path))
@@ -669,7 +741,7 @@ class WaferMapTool(tk.Tk):
     def _load_thread(self):
         t0 = time.time()
         try:
-            grid, designs, counts, sheet, fmt, null_char = \
+            grid, designs, counts, sheet, fmt, null_char, source_kind, meta = \
                 detect_and_parse(self.filepath)
 
             rows = len(grid)
@@ -700,18 +772,19 @@ class WaferMapTool(tk.Tk):
             }
 
             self.after(0, lambda: self._on_load_done(
-                grid, enc, sheet, fmt, null_char, designs, counts,
+                grid, enc, sheet, fmt, null_char, source_kind, meta, designs, counts,
                 cm_rgb, cm_xlsx, rows, cols, fsize_s, elapsed,
-                fmt_labels[fmt]))
+                fmt_labels.get(fmt, "Text Map (.txt)")))
         except Exception as e:
             import traceback
             self.after(0, lambda: self._on_load_error(str(e)+"\n"+traceback.format_exc()))
 
-    def _on_load_done(self, grid, enc, sheet, fmt, null_char, designs, counts,
+    def _on_load_done(self, grid, enc, sheet, fmt, null_char, source_kind, meta, designs, counts,
                       cm_rgb, cm_xlsx, rows, cols, fsize_s, elapsed, fmt_label):
         self.progress.stop(); self.progress.pack_forget()
         self.grid_data=grid; self.enc=enc; self.source_sheet=sheet
         self.file_fmt=fmt; self.null_char=null_char
+        self.source_kind=source_kind; self.source_meta=meta or {}
         self.designs=designs; self.design_counts=counts
         self.cm_rgb=cm_rgb; self.cm_xlsx=cm_xlsx
         self.selected_designs.clear(); self.zoom=1.0
@@ -1116,22 +1189,30 @@ class WaferMapTool(tk.Tk):
 
     def _export_txt(self, path, le):
         try:
-            sel=self.selected_designs; nl="\r\n" if le=="crlf" else "\n"
+            sel=self.selected_designs
+            nl="\r\n" if le=="crlf" else "\n"
             lines=[]; die_count=0
+            edge_char = '*' if self.source_kind == 'txt' else 'X'
+            null_char = self.null_char if self.null_char not in (None, '') else '.'
             for row in self.grid_data:
                 parts=[]
                 for val in row:
-                    if val=='.':      parts.append('.')
-                    elif val=='X':    parts.append('X')
+                    if val=='.':      parts.append(null_char)
+                    elif val=='X':    parts.append(edge_char)
                     elif val in sel:  parts.append('1'); die_count+=1
                     else:             parts.append('x')
                 lines.append(''.join(parts))
+
+            if self.source_kind == 'txt' and self.source_meta.get('had_wrapper'):
+                out_lines = list(self.source_meta.get('prefix_lines', [])) + lines + list(self.source_meta.get('suffix_lines', []))
+            else:
+                out_lines = lines
+
             with open(path,'w',encoding='utf-8',newline='') as f:
-                f.write(nl.join(lines))
+                f.write(nl.join(out_lines))
             self.after(0,lambda: self._on_done(path,die_count,"txt"))
         except Exception as e:
             self.after(0,lambda: self._on_err(str(e)))
-
     def _on_done(self, path, die_count, fmt):
         self.progress.stop(); self.progress.pack_forget()
         fname=os.path.basename(path)
@@ -1158,6 +1239,7 @@ class WaferMapTool(tk.Tk):
                 icon="warning"):
             return
         self.filepath=None; self.grid_data=[]; self.enc=None
+        self.source_kind='xlsx'; self.source_meta={}
         self.designs=[]; self.design_counts={}
         self.selected_designs.clear(); self.design_vars={}; self._hover_jobs={}; self.zoom=1.0; self.prev_zoom=1.0
         self._lut=None; self._prev_lut=None; self._lut_dirty=True
