@@ -1255,7 +1255,8 @@ class WaferMapTool(tk.Tk):
             nl="\r\n" if le=="crlf" else "\n"
             lines=[]
             selected_count=0
-            total_die_chars=0
+            export_all = not bool(self.selected_designs)
+
             for row in self.grid_data:
                 parts=[]
                 for val in row:
@@ -1264,13 +1265,14 @@ class WaferMapTool(tk.Tk):
                     elif val == 'X':
                         parts.append(self._map_output_char('X'))
                     else:
-                        total_die_chars += 1
-                        if val in self.selected_designs:
+                        if export_all or val in self.selected_designs:
                             selected_count += 1
-                        parts.append(self._map_output_char(val))
+                            parts.append(self._map_output_char(val))
+                        else:
+                            parts.append(self._map_output_char('x'))
                 lines.append(''.join(parts))
 
-            prefix_lines, suffix_lines = self._build_txt_wrapper(path, total_die_chars)
+            prefix_lines, suffix_lines = self._build_txt_wrapper(path, selected_count)
             out_lines = list(prefix_lines) + lines + list(suffix_lines)
 
             with open(path,'w',encoding='utf-8',newline='') as f:
