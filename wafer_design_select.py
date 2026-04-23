@@ -364,6 +364,8 @@ class WaferMapTool(tk.Tk):
         self.cm_xlsx          = {}
         self.design_vars      = {}
         self._hover_jobs      = {}
+        self.char_map_designs = {}
+        self.char_map_special = {}
         self.zoom             = 1.0
         self._photo           = None
         self._pending         = False
@@ -387,6 +389,7 @@ class WaferMapTool(tk.Tk):
         fm.add_command(label="Open File...\tCtrl+O", command=self._open_file)
         fm.add_separator()
         fm.add_command(label="Export...\tCtrl+E",    command=self._export)
+        fm.add_command(label="Character Mapping...", command=self._open_char_map_dialog)
         fm.add_separator()
         fm.add_command(label="Exit",                  command=self.destroy)
         mb.add_cascade(label="File", menu=fm)
@@ -432,6 +435,7 @@ class WaferMapTool(tk.Tk):
 
         btn("📂  Open",      self._open_file,  sep_after=True)
         btn("⟳  Refresh",   self._do_convert)
+        btn("🔤  Chars",    self._open_char_map_dialog)
         btn("💾  Export",    self._export,      sep_after=True, tag="tb_export")
         self.tb_export.config(state="disabled", fg="#aaaaaa")
 
@@ -788,6 +792,14 @@ class WaferMapTool(tk.Tk):
         self.designs=designs; self.design_counts=counts
         self.cm_rgb=cm_rgb; self.cm_xlsx=cm_xlsx
         self.selected_designs.clear(); self.zoom=1.0
+        self.char_map_designs = {d: str(d) for d in designs}
+        edge_default = '*' if source_kind == 'txt' else 'X'
+        self.char_map_special = {
+            'selected': '1',
+            'unselected': 'x',
+            'null': '.',
+            'edge': edge_default,
+        }
         self._lut = None; self._prev_lut = None; self._lut_dirty = True
 
         fname = os.path.basename(self.filepath)
@@ -802,6 +814,12 @@ class WaferMapTool(tk.Tk):
             f"✔  {fname}  ·  {len(designs)} designs detected  ·  {rows}×{cols}  ·  {fmt_label}")
 
         self._populate_designs()
+        self.export_btn.config(state="normal", bg=BLUE, fg="white")
+        self.tb_export.config(state="normal", fg="#111", bg=WIN_BG, relief="flat")
+        self.tb_export.bind("<Enter>",
+            lambda e: self.tb_export.config(bg="#d9e8f5", fg="#0055aa", relief="groove"))
+        self.tb_export.bind("<Leave>",
+            lambda e: self.tb_export.config(bg=WIN_BG, fg="#111", relief="flat"))
         self._render_map()
         self.after(100, self._render_preview)
 
@@ -933,16 +951,16 @@ class WaferMapTool(tk.Tk):
         self.sel_die_var.set(f"{die:,}" if n else "—")
         self.sel_names_var.set(", ".join(sorted(self.selected_designs)) if n else "—")
 
-        en = "normal" if n else "disabled"
+        en = "normal" if self.grid_data else "disabled"
         # Bottom Export button
         self.export_btn.config(state=en,
-                                bg=BLUE if n else WIN_BG,
-                                fg="white" if n else "#aaaaaa")
+                                bg=BLUE if en == "normal" else WIN_BG,
+                                fg="white" if en == "normal" else "#aaaaaa")
         # Toolbar Export button — restore hover bindings when enabled
         self.tb_export.config(state=en,
-                               fg="#111" if n else "#aaaaaa",
+                               fg="#111" if en == "normal" else "#aaaaaa",
                                bg=WIN_BG, relief="flat")
-        if n:
+        if en == "normal":
             self.tb_export.bind("<Enter>",
                 lambda e: self.tb_export.config(bg="#d9e8f5", fg="#0055aa", relief="groove"))
             self.tb_export.bind("<Leave>",
@@ -1127,13 +1145,58 @@ class WaferMapTool(tk.Tk):
     def _zoom_out(self):   self.zoom=max(self.zoom/1.5,.05); self._schedule_redraw()
     def _zoom_fit(self):   self.zoom=1.0; self._schedule_redraw()
 
+
+    def _open_char_map_dialog(self):
+        if not self.grid_data:
+            messagebox.showinfo("No File", "Open a file first.")
+            return
+        dlg = CharMapDialog(self, self.designs, self.char_map_designs, self.char_map_special)
+        self.wait_window(dlg)
+        if dlg.result:
+            self.char_map_designs = dlg.result['designs']
+            self.char_map_special = dlg.result['special']
+            self._set_status("Character mapping updated")
+
+    def _map_output_char(self, cell_val):
+        if cell_val == '.':
+            return self.char_map_special.get('null', '.') or '.'
+        if cell_val == 'X':
+            return self.char_map_special.get('edge', '*' if self.source_kind == 'txt' else 'X') or 'X'
+        if cell_val == 'x':
+            return self.char_map_special.get('unselected', 'x') or 'x'
+        if cell_val in self.char_map_designs:
+            mapped = self.char_map_designs.get(cell_val, str(cell_val))
+            return mapped if mapped not in (None, '') else str(cell_val)
+        return str(cell_val)
+
+    def _build_txt_wrapper(self, output_basename, total_die_chars):
+        prefix = list(self.source_meta.get('prefix_lines', []))
+        suffix = list(self.source_meta.get('suffix_lines', []))
+        if self.source_kind == 'txt' and self.source_meta.get('had_wrapper') and prefix and suffix:
+            return prefix, suffix
+
+        wafer_id = os.path.splitext(os.path.basename(output_basename))[0]
+        prefix = [
+            'WAFER MAP = {',
+            f'WAFER ID = "{wafer_id}"',
+            'FLAT_NOTCH = 0',
+            'LOT_ID = ""',
+            'WAFER_SIZE = 0 // mm',
+            'X_SIZE =0 // um',
+            'Y_SIZE =0 // um',
+            f'DIES = {total_die_chars}',
+            f'BIN = "1", {total_die_chars} "PASS",""',
+            'MAP = {',
+            '',
+        ]
+        suffix = ['  }', '}']
+        return prefix, suffix
+
     # ── export ────────────────────────────────────────────────────────────
     def _export(self):
-        if not self.selected_designs:
-            messagebox.showwarning("No Selection",
-                "Select at least one design first."); return
-        die = sum(self.design_counts.get(d,0) for d in self.selected_designs)
-        dlg = ExportDialog(self, sorted(self.selected_designs), die)
+        export_designs = sorted(self.selected_designs) if self.selected_designs else list(self.designs)
+        die = sum(self.design_counts.get(d,0) for d in export_designs)
+        dlg = ExportDialog(self, export_designs, die, has_selection=bool(self.selected_designs))
         self.wait_window(dlg)
         if not dlg.result: return
 
@@ -1189,28 +1252,30 @@ class WaferMapTool(tk.Tk):
 
     def _export_txt(self, path, le):
         try:
-            sel=self.selected_designs
             nl="\r\n" if le=="crlf" else "\n"
-            lines=[]; die_count=0
-            edge_char = '*' if self.source_kind == 'txt' else 'X'
-            null_char = self.null_char if self.null_char not in (None, '') else '.'
+            lines=[]
+            selected_count=0
+            total_die_chars=0
             for row in self.grid_data:
                 parts=[]
                 for val in row:
-                    if val=='.':      parts.append(null_char)
-                    elif val=='X':    parts.append(edge_char)
-                    elif val in sel:  parts.append('1'); die_count+=1
-                    else:             parts.append('x')
+                    if val == '.':
+                        parts.append(self._map_output_char('.'))
+                    elif val == 'X':
+                        parts.append(self._map_output_char('X'))
+                    else:
+                        total_die_chars += 1
+                        if val in self.selected_designs:
+                            selected_count += 1
+                        parts.append(self._map_output_char(val))
                 lines.append(''.join(parts))
 
-            if self.source_kind == 'txt' and self.source_meta.get('had_wrapper'):
-                out_lines = list(self.source_meta.get('prefix_lines', [])) + lines + list(self.source_meta.get('suffix_lines', []))
-            else:
-                out_lines = lines
+            prefix_lines, suffix_lines = self._build_txt_wrapper(path, total_die_chars)
+            out_lines = list(prefix_lines) + lines + list(suffix_lines)
 
             with open(path,'w',encoding='utf-8',newline='') as f:
                 f.write(nl.join(out_lines))
-            self.after(0,lambda: self._on_done(path,die_count,"txt"))
+            self.after(0,lambda: self._on_done(path,selected_count,"txt"))
         except Exception as e:
             self.after(0,lambda: self._on_err(str(e)))
     def _on_done(self, path, die_count, fmt):
@@ -1242,6 +1307,7 @@ class WaferMapTool(tk.Tk):
         self.source_kind='xlsx'; self.source_meta={}
         self.designs=[]; self.design_counts={}
         self.selected_designs.clear(); self.design_vars={}; self._hover_jobs={}; self.zoom=1.0; self.prev_zoom=1.0
+        self.char_map_designs={}; self.char_map_special={}
         self._lut=None; self._prev_lut=None; self._lut_dirty=True
         self.breadcrumb.config(text="No file loaded")
         for w in self.design_inner.winfo_children(): w.destroy()
@@ -1267,7 +1333,7 @@ class WaferMapTool(tk.Tk):
 #  EXPORT DIALOG
 # ═══════════════════════════════════════════════════════════════════════
 class ExportDialog(tk.Toplevel):
-    def __init__(self, parent, designs, die_count):
+    def __init__(self, parent, designs, die_count, has_selection=True):
         super().__init__(parent)
         self.title("Export")
         self.resizable(False, False)
@@ -1291,10 +1357,12 @@ class ExportDialog(tk.Toplevel):
         # info box
         ib = tk.Frame(body, bg="#deeaf7", relief="solid", bd=1)
         ib.pack(fill="x", pady=(0,12))
-        tk.Label(ib, text=f"  Exporting:  {', '.join(designs)}",
+        export_label = ', '.join(designs) if designs else 'All detected designs'
+        die_label = f"Die in selected designs:  {die_count:,}" if has_selection else f"Die in full map:  {die_count:,}"
+        tk.Label(ib, text=f"  Exporting:  {export_label}",
                  font=("Segoe UI",8,"bold"), bg="#deeaf7",
                  anchor="w").pack(fill="x", padx=6, pady=(5,1))
-        tk.Label(ib, text=f"  Die → Bin 1:  {die_count:,}",
+        tk.Label(ib, text=f"  {die_label}",
                  font=("Segoe UI",8), bg="#deeaf7", fg="#555",
                  anchor="w").pack(fill="x", padx=6, pady=(1,5))
 
@@ -1362,6 +1430,109 @@ class ExportDialog(tk.Toplevel):
         self.result = {"fmt":self.fmt.get(), "le":self.le.get()}
         self.destroy()
 
+
+class CharMapDialog(tk.Toplevel):
+    def __init__(self, parent, designs, design_map, special_map):
+        super().__init__(parent)
+        self.title("Character Mapping")
+        self.resizable(True, True)
+        self.grab_set()
+        self.result = None
+        self.configure(bg=WIN_BG)
+        x = parent.winfo_x() + parent.winfo_width()//2 - 260
+        y = parent.winfo_y() + parent.winfo_height()//2 - 260
+        self.geometry(f"520x560+{x}+{y}")
+
+        hdr = tk.Frame(self, bg=BLUE)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="  Character Mapping",
+                 font=("Segoe UI",11,"bold"),
+                 bg=BLUE, fg="white", pady=9).pack(side="left")
+
+        body = tk.Frame(self, bg=WIN_BG)
+        body.pack(fill="both", expand=True, padx=14, pady=12)
+        tk.Label(body,
+                 text="Set the output character for any design or special symbol. Leave a field unchanged to keep its current value.",
+                 justify="left", wraplength=470,
+                 font=("Segoe UI",8), bg=WIN_BG, fg="#555").pack(anchor="w", pady=(0,8))
+
+        sf = tk.Frame(body, bg=WIN_BG)
+        sf.pack(fill="both", expand=True)
+        canvas = tk.Canvas(sf, bg=WIN_BG, highlightthickness=0)
+        vsb = ttk.Scrollbar(sf, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg=WIN_BG)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        canvas.create_window((0,0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        self.design_vars = {}
+        self.special_vars = {}
+
+        def add_row(parent_frame, label, current_value, target_dict, key):
+            row = tk.Frame(parent_frame, bg=WIN_BG)
+            row.pack(fill="x", pady=2)
+            tk.Label(row, text=label, width=20, anchor="w", bg=WIN_BG, font=("Segoe UI",9)).pack(side="left")
+            ent = tk.Entry(row, width=8, font=("Consolas", 10))
+            ent.pack(side="left", padx=(0,8))
+            ent.insert(0, current_value)
+            tk.Label(row, text=f"current: {current_value!r}", bg=WIN_BG, fg="#666", font=("Segoe UI",8)).pack(side="left")
+            target_dict[key] = ent
+
+        special_box = ttk.LabelFrame(inner, text=" Special symbols ")
+        special_box.pack(fill="x", pady=(0,8))
+        add_row(special_box, "Null / empty", special_map.get('null', '.'), self.special_vars, 'null')
+        add_row(special_box, "Edge / drop-in", special_map.get('edge', '*'), self.special_vars, 'edge')
+        add_row(special_box, "Selected fallback", special_map.get('selected', '1'), self.special_vars, 'selected')
+        add_row(special_box, "Unselected fallback", special_map.get('unselected', 'x'), self.special_vars, 'unselected')
+
+        design_box = ttk.LabelFrame(inner, text=" Design characters ")
+        design_box.pack(fill="both", expand=True)
+        for d in designs:
+            add_row(design_box, f"Design {d}", str(design_map.get(d, d)), self.design_vars, d)
+
+        btns = tk.Frame(body, bg=WIN_BG)
+        btns.pack(fill="x", pady=(10,0))
+
+        def reset_defaults():
+            for key, ent in self.special_vars.items():
+                ent.delete(0, 'end')
+                defaults = {'null': '.', 'edge': '*', 'selected': '1', 'unselected': 'x'}
+                ent.insert(0, defaults.get(key, ''))
+            for d, ent in self.design_vars.items():
+                ent.delete(0, 'end')
+                ent.insert(0, str(d))
+
+        tk.Button(btns, text="Reset Defaults", command=reset_defaults,
+                  font=("Segoe UI",9), relief="raised", bd=2,
+                  bg=WIN_BG, padx=10, pady=4, cursor="hand2").pack(side="left")
+        tk.Button(btns, text="Cancel", command=self.destroy,
+                  font=("Segoe UI",9), relief="raised", bd=2,
+                  bg=WIN_BG, padx=10, pady=4, cursor="hand2").pack(side="right", padx=(6,0))
+        tk.Button(btns, text="Save", command=self._ok,
+                  font=("Segoe UI",9,"bold"), relief="raised", bd=2,
+                  bg=BLUE, fg="white", activebackground=BLUE_HOV,
+                  activeforeground="white", padx=14, pady=4,
+                  cursor="hand2").pack(side="right")
+
+    def _ok(self):
+        special = {}
+        designs = {}
+        for key, ent in self.special_vars.items():
+            value = ent.get()
+            if value == '':
+                messagebox.showwarning("Invalid character", f"The value for {key} cannot be empty.")
+                return
+            special[key] = value
+        for d, ent in self.design_vars.items():
+            value = ent.get()
+            if value == '':
+                messagebox.showwarning("Invalid character", f"The value for design {d} cannot be empty.")
+                return
+            designs[d] = value
+        self.result = {'special': special, 'designs': designs}
+        self.destroy()
 
 # ── run ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
