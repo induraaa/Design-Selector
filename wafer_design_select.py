@@ -1,10 +1,5 @@
 """
-Wafer Design Picker Tool  v2
-Enhanced with Wafer Details Editor
-
-Separates wafer metadata (WAFER MAP = {...}) from the grid display,
-allowing independent viewing and editing of wafer parameters.
-
+Wafer Design Picker Tool  v1
 Universal format detection — supports all known SCR file variants.
 
 Detected formats
@@ -154,18 +149,15 @@ def _fast_read_xlsx(filepath):
 
 
 def _read_text_map(filepath):
-    """
-    Read a text wafer map. Extracts two parts:
-      1. Wafer details (MAP = { ... })
-      2. Grid data (the actual map)
-    
-    Returns (grid, sheet_name, wafer_details, meta)
-    wafer_details is dict of {key: value} pairs from the MAP wrapper
+    """Read a text wafer map. Supports either:
+      - raw grid text (one row per line), or
+      - wrapped wafer-map files containing MAP = { ... }
+    Returns (raw, sheet_name, meta) where raw is list[list[str]].
+    meta stores wrapper/header/footer info for round-trip txt export.
     """
     with open(filepath, 'r', encoding='utf-8-sig', errors='replace') as f:
         lines = f.read().splitlines()
 
-    # Find the MAP = { ... } wrapper
     start_idx = None
     end_idx = None
     for i, line in enumerate(lines):
@@ -173,47 +165,26 @@ def _read_text_map(filepath):
             start_idx = i
             break
 
-    wafer_details = {}
-    prefix_lines = []
-    suffix_lines = []
-    map_lines = []
-
     if start_idx is not None:
-        # Extract wafer metadata (before the grid)
         for j in range(start_idx + 1, len(lines)):
             if lines[j].strip() == '}':
                 end_idx = j
                 break
-            # Parse key=value lines
-            line = lines[j].strip()
-            if line and not line.startswith('MAP'):
-                match = re.match(r'([A-Z_]+)\s*=\s*"?([^"]*)"?', line)
-                if match:
-                    key = match.group(1)
-                    val = match.group(2)
-                    wafer_details[key] = val
 
+    if start_idx is not None and end_idx is not None and end_idx > start_idx:
+        map_lines = lines[start_idx + 1:end_idx]
         prefix_lines = lines[:start_idx + 1]
-        if end_idx is not None:
-            # Everything after MAP = { and before the final }
-            map_start = None
-            for j in range(start_idx + 1, end_idx):
-                if lines[j].strip().startswith('MAP'):
-                    map_start = j + 1
-                    break
-            if map_start:
-                map_lines = lines[map_start:end_idx]
-            suffix_lines = lines[end_idx:]
+        suffix_lines = lines[end_idx:]
+        sheet_name = 'MAP'
     else:
         map_lines = lines
+        prefix_lines = []
+        suffix_lines = []
         sheet_name = os.path.splitext(os.path.basename(filepath))[0]
 
-    # Clean map lines
     map_lines = [ln.rstrip('\r\n') for ln in map_lines if ln.strip() != '']
     width = max((len(ln) for ln in map_lines), default=0)
-    grid = [list(ln.ljust(width)) for ln in map_lines]
-
-    sheet_name = wafer_details.get('WAFER_ID', os.path.splitext(os.path.basename(filepath))[0])
+    raw = [list(ln.ljust(width)) for ln in map_lines]
 
     meta = {
         'type': 'txt',
@@ -221,7 +192,7 @@ def _read_text_map(filepath):
         'suffix_lines': suffix_lines,
         'had_wrapper': bool(prefix_lines or suffix_lines),
     }
-    return grid, sheet_name, wafer_details, meta
+    return raw, sheet_name, meta
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -237,18 +208,16 @@ def detect_and_parse(filepath):
       fmt         : 'A' | 'B' | 'C' | 'TXT'
       null_char   : str         — original null character found in file
       source_kind : str         — 'xlsx' or 'txt'
-      wafer_details: dict       — metadata from wrapper (if txt)
       meta        : dict        — optional source metadata for export
     """
     ext = os.path.splitext(filepath)[1].lower()
     source_kind = 'txt' if ext == '.txt' else 'xlsx'
     meta = {'type': source_kind}
-    wafer_details = {}
 
     if source_kind == 'txt':
-        grid, sheet_name, wafer_details, meta = _read_text_map(filepath)
+        raw, sheet_name, meta = _read_text_map(filepath)
 
-        non_null = [c for row in grid for c in row if c not in (None, '')]
+        non_null = [c for row in raw for c in row if c not in (None, '')]
         val_counts = Counter(non_null)
         if val_counts.get('*', 0) > 0:
             edge_chars = {'*', 'X'}
@@ -263,7 +232,7 @@ def detect_and_parse(filepath):
             null_chars = {'.', ' '}
             null_char = '.'
 
-        grid = _normalise_grid(grid, null_chars=null_chars, edge_chars=edge_chars)
+        grid = _normalise_grid(raw, null_chars=null_chars, edge_chars=edge_chars)
         fmt = 'TXT'
     else:
         raw, sheet_name = _fast_read_xlsx(filepath)
@@ -308,7 +277,7 @@ def detect_and_parse(filepath):
 
     designs = _sort_designs(list(counts.keys()))
 
-    return grid, designs, dict(counts), sheet_name, fmt, null_char, source_kind, wafer_details, meta
+    return grid, designs, dict(counts), sheet_name, fmt, null_char, source_kind, meta
 
 
 def _normalise_grid(raw, null_chars, edge_chars):
@@ -362,8 +331,8 @@ def _sort_designs(design_list):
 class WaferMapTool(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Design Picker v2")
-        self.minsize(1400, 750)
+        self.title("Design Picker")
+        self.minsize(1200, 700)
         self.configure(bg=WIN_BG)
         self.state("zoomed")   # maximised on Windows; harmless on others
 
@@ -386,7 +355,6 @@ class WaferMapTool(tk.Tk):
         self.null_char        = '.'
         self.source_kind      = 'xlsx'
         self.source_meta      = {}
-        self.wafer_details    = {}
         self.grid_data        = []
         self.enc              = None
         self.designs          = []
@@ -401,11 +369,11 @@ class WaferMapTool(tk.Tk):
         self.zoom             = 1.0
         self._photo           = None
         self._pending         = False
-        self.prev_zoom        = 1.0
-        self._prev_photo      = None
-        self._lut             = None
-        self._prev_lut        = None
-        self._lut_dirty       = True
+        self.prev_zoom        = 1.0   # zoom for preview canvas
+        self._prev_photo      = None  # keep reference
+        self._lut             = None  # colour lookup table (map)
+        self._prev_lut        = None  # colour lookup table (preview)
+        self._lut_dirty       = True  # rebuild LUT on next render
 
         self._build_menu()
         self._build_toolbar()
@@ -422,14 +390,14 @@ class WaferMapTool(tk.Tk):
         fm.add_separator()
         fm.add_command(label="Export...\tCtrl+E",    command=self._export)
         fm.add_command(label="Character Mapping...", command=self._open_char_map_dialog)
+        fm.add_command(label="Field Layout Conversion...", command=self._open_field_layout_dialog)
         fm.add_separator()
         fm.add_command(label="Exit",                  command=self.destroy)
         mb.add_cascade(label="File", menu=fm)
         hm = tk.Menu(mb, tearoff=0)
         hm.add_command(label="About", command=lambda: messagebox.showinfo(
             "About",
-            "Design Picker v2\n\n"
-            "Enhanced with Wafer Details Editor\n\n"
+            "Design Picker\n\n"
             "Supports all SCR wafer map formats:\n"
             "  Format A  —  null='.', edge='X'\n"
             "  Format B  —  null='-', edge='X'\n"
@@ -449,6 +417,7 @@ class WaferMapTool(tk.Tk):
                           cursor="hand2", fg="#111")
             if w:
                 b.config(width=w)
+            # Smooth hover: blue tint in, fade out
             def _hov_in(e, _b=b):
                 if str(_b.cget("state")) != "disabled":
                     _b.config(bg="#d9e8f5", fg="#0055aa", relief="groove")
@@ -468,7 +437,7 @@ class WaferMapTool(tk.Tk):
         btn("📂  Open",      self._open_file,  sep_after=True)
         btn("⟳  Refresh",   self._do_convert)
         btn("🔤  Chars",    self._open_char_map_dialog)
-        btn("📋 Details",   self._open_wafer_details_dialog, sep_after=True)
+        btn("🧩  Layout",   self._open_field_layout_dialog)
         btn("💾  Export",    self._export,      sep_after=True, tag="tb_export")
         self.tb_export.config(state="disabled", fg="#aaaaaa")
 
@@ -476,8 +445,11 @@ class WaferMapTool(tk.Tk):
         btn("🔍−  Zoom Out", self._zoom_out)
         btn("⊞  Fit",        self._zoom_fit,   sep_after=True)
 
+        # Select All / None shortcut buttons in toolbar
         btn("☑  All",        self._select_all)
         btn("☐  None",       self._select_none, sep_after=True)
+
+        # Reset button in toolbar
         btn("↺  Reset",      self._reset)
 
         self.show_grid = tk.BooleanVar(value=False)
@@ -503,17 +475,11 @@ class WaferMapTool(tk.Tk):
         body = tk.Frame(self, bg=WIN_BG)
         body.pack(fill="both", expand=True, padx=6, pady=(4,0))
 
-        # Outer PanedWindow: [left: file info + designs] | [centre: map] | [right: preview + details]
+        # ── outer PanedWindow: [centre area] | [right panel] ─────────────
         outer_pane = ttk.PanedWindow(body, orient="horizontal")
         outer_pane.pack(fill="both", expand=True)
 
-        # ── LEFT PANEL: File info + Designs ────────────────────────────
-        left = tk.Frame(outer_pane, bg=WIN_BG, width=280)
-        left.pack_propagate(False)
-        outer_pane.add(left, weight=0)
-        self._build_left(left)
-
-        # ── CENTRE PanedWindow: [map] | [preview] ────────────────────
+        # ── centre PanedWindow: [map] | [txt preview] ────────────────────
         centre_pane = ttk.PanedWindow(outer_pane, orient="horizontal")
         outer_pane.add(centre_pane, weight=3)
 
@@ -532,14 +498,15 @@ class WaferMapTool(tk.Tk):
         self.canvas.pack(fill="both", expand=True, padx=2, pady=2)
         self._draw_placeholder()
 
+        # Bind mouse-wheel zoom: Ctrl+scroll anywhere on canvas
         self.canvas.bind("<MouseWheel>",          self._on_canvas_scroll)
-        self.canvas.bind("<Button-4>",            self._on_canvas_scroll)
-        self.canvas.bind("<Button-5>",            self._on_canvas_scroll)
+        self.canvas.bind("<Button-4>",            self._on_canvas_scroll)  # Linux scroll up
+        self.canvas.bind("<Button-5>",            self._on_canvas_scroll)  # Linux scroll down
         self.canvas.bind("<Control-MouseWheel>",  self._on_canvas_zoom)
         self.canvas.bind("<Control-Button-4>",    self._on_canvas_zoom)
         self.canvas.bind("<Control-Button-5>",    self._on_canvas_zoom)
 
-        # Preview canvas
+        # Preview canvas — shows selected design only (same style as map)
         prev_card = ttk.LabelFrame(centre_pane,
                                     text=" Selected Design Preview ",
                                     labelanchor="nw")
@@ -555,6 +522,7 @@ class WaferMapTool(tk.Tk):
         self.prev_canvas.pack(fill="both", expand=True, padx=2, pady=2)
         self._draw_prev_placeholder()
 
+        # Same scroll/zoom bindings as the main canvas
         self.prev_canvas.bind("<MouseWheel>",         self._on_prev_scroll)
         self.prev_canvas.bind("<Button-4>",           self._on_prev_scroll)
         self.prev_canvas.bind("<Button-5>",           self._on_prev_scroll)
@@ -562,14 +530,58 @@ class WaferMapTool(tk.Tk):
         self.prev_canvas.bind("<Control-Button-4>",   self._on_prev_zoom)
         self.prev_canvas.bind("<Control-Button-5>",   self._on_prev_zoom)
 
-        # RIGHT PANEL: Details ─────────────────────────────────────────
-        right = tk.Frame(outer_pane, bg=WIN_BG, width=320)
+        # Right panel (fixed 270px)
+        right = tk.Frame(outer_pane, bg=WIN_BG, width=270)
         right.pack_propagate(False)
         outer_pane.add(right, weight=0)
         self._build_right(right)
 
-    def _build_left(self, parent):
-        """File info + Designs panel"""
+    # ── canvas scroll / zoom ──────────────────────────────────────────────
+    def _on_canvas_scroll(self, event):
+        """Plain scroll → pan vertically (Ctrl held → zoom instead)."""
+        if event.state & 0x4:          # Ctrl key is down
+            self._on_canvas_zoom(event)
+            return
+        # pan
+        if event.num == 4:
+            self.canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            self.canvas.yview_scroll(1, "units")
+        else:
+            self.canvas.yview_scroll(-1*(event.delta//120), "units")
+
+    def _on_canvas_zoom(self, event):
+        """Ctrl+scroll → zoom in/out centred on mouse position."""
+        if event.num == 4 or (hasattr(event,'delta') and event.delta > 0):
+            factor = 1.15
+        else:
+            factor = 1/1.15
+
+        old_zoom = self.zoom
+        self.zoom = max(0.05, min(16.0, self.zoom * factor))
+        if abs(self.zoom - old_zoom) < 0.001:
+            return
+
+        # keep the point under the cursor fixed after zoom
+        cx = self.canvas.canvasx(event.x)
+        cy = self.canvas.canvasy(event.y)
+        ratio = self.zoom / old_zoom
+        self._schedule_redraw()
+        def _adjust():
+            sr = self.canvas.cget("scrollregion")
+            if not sr: return
+            _, _, sw, sh = map(float, sr.split())
+            new_cx = cx * ratio
+            new_cy = cy * ratio
+            vw = self.canvas.winfo_width()
+            vh = self.canvas.winfo_height()
+            fx = max(0.0, min(1.0, (new_cx - event.x) / sw))
+            fy = max(0.0, min(1.0, (new_cy - event.y) / sh))
+            self.canvas.xview_moveto(fx)
+            self.canvas.yview_moveto(fy)
+        self.after(60, _adjust)
+
+    def _build_right(self, parent):
         # ── File Info ────────────────────────────────────────────────────
         fi = ttk.LabelFrame(parent, text=" File Info ", labelanchor="nw")
         fi.pack(fill="x", padx=0, pady=(0,6))
@@ -590,6 +602,7 @@ class WaferMapTool(tk.Tk):
         dc = ttk.LabelFrame(parent, text=" Designs ", labelanchor="nw")
         dc.pack(fill="both", expand=True, padx=0, pady=(0,6))
 
+        # column headers
         hdr = tk.Frame(dc, bg=HDR_BG); hdr.pack(fill="x")
         tk.Label(hdr, text="  Design", font=("Segoe UI",8,"bold"),
                  bg=HDR_BG, width=12, anchor="w").pack(side="left", padx=(20,0), pady=3)
@@ -597,6 +610,7 @@ class WaferMapTool(tk.Tk):
                  bg=HDR_BG, anchor="e").pack(side="right", padx=8)
         ttk.Separator(dc).pack(fill="x")
 
+        # scrollable list
         lc = tk.Canvas(dc, bg=WIN_BG, highlightthickness=0, bd=0)
         ls = ttk.Scrollbar(dc, orient="vertical", command=lc.yview)
         lc.configure(yscrollcommand=ls.set)
@@ -619,6 +633,7 @@ class WaferMapTool(tk.Tk):
 
         ttk.Separator(dc).pack(fill="x")
 
+        # All / None + count
         bot = tk.Frame(dc, bg=WIN_BG); bot.pack(fill="x", padx=8, pady=5)
         tk.Button(bot, text="All",  command=self._select_all,
                   font=("Segoe UI",8), relief="raised", bd=2,
@@ -631,8 +646,6 @@ class WaferMapTool(tk.Tk):
                                        bg=WIN_BG, fg="#555")
         self.sel_count_lbl.pack(side="right")
 
-    def _build_right(self, parent):
-        """Wafer Details panel"""
         # ── Selection Summary ─────────────────────────────────────────────
         sc = ttk.LabelFrame(parent, text=" Selection ", labelanchor="nw")
         sc.pack(fill="x", padx=0, pady=(0,6))
@@ -651,51 +664,18 @@ class WaferMapTool(tk.Tk):
         self.sel_names_var = tk.StringVar(value="—")
         tk.Label(r2, textvariable=self.sel_names_var,
                  font=("Segoe UI",8), bg=WIN_BG, fg="#333",
-                 wraplength=248, justify="left").pack(side="left")
-
-        # ── Wafer Details ─────────────────────────────────────────────────
-        wd = ttk.LabelFrame(parent, text=" Wafer Details ", labelanchor="nw")
-        wd.pack(fill="both", expand=True, padx=0, pady=(0,6))
-
-        # Scrollable details list
-        wc = tk.Canvas(wd, bg=WIN_BG, highlightthickness=0, bd=0)
-        ws = ttk.Scrollbar(wd, orient="vertical", command=wc.yview)
-        wc.configure(yscrollcommand=ws.set)
-        ws.pack(side="right", fill="y", padx=(0,2), pady=2)
-        wc.pack(side="left", fill="both", expand=True)
-        wc.bind("<MouseWheel>",
-            lambda e: wc.yview_scroll(-1*(e.delta//120),"units"))
-        self._details_canvas = wc
-
-        self.details_inner = tk.Frame(wc, bg=WIN_BG)
-        wc.create_window((0,0), window=self.details_inner, anchor="nw")
-        self.details_inner.bind("<Configure>",
-            lambda e: wc.configure(scrollregion=wc.bbox("all")))
-
-        self._details_empty = tk.Label(self.details_inner,
-                                        text="No details loaded",
-                                        font=("Segoe UI",8,"italic"),
-                                        bg=WIN_BG, fg="#999")
-        self._details_empty.pack(pady=14)
-
-        # Edit button
-        ttk.Separator(wd).pack(fill="x")
-        eb = tk.Frame(wd, bg=WIN_BG); eb.pack(fill="x", padx=8, pady=6)
-        tk.Button(eb, text="Edit Details", command=self._open_wafer_details_dialog,
-                  font=("Segoe UI",8,"bold"), relief="raised", bd=2,
-                  bg=BLUE, fg="white", activebackground=BLUE_HOV,
-                  activeforeground="white", padx=8, pady=2,
-                  cursor="hand2").pack(fill="x")
+                 wraplength=158, justify="left").pack(side="left")
 
         # ── Legend ────────────────────────────────────────────────────────
         lg = ttk.LabelFrame(parent, text=" Legend ", labelanchor="nw")
         lg.pack(fill="x", padx=0, pady=(0,0))
 
+        self._legend_null_lbl = None
         for colour, char, label in [
-            ("#00aa00","1",  "Selected → Bin 1"),
-            ("#6e6e6e","X",  "Edge die"),
-            ("#f0f0f0",".",  "Null area"),
-            ("#d2d2d2","x",  "Unselected"),
+            ("#00aa00","1",  "Selected design → Bin 1"),
+            ("#6e6e6e","X",  "Edge / drop-in die"),
+            ("#f0f0f0",".",  "Outer null area"),
+            ("#d2d2d2","x",  "Opted-out design"),
         ]:
             row = tk.Frame(lg, bg=WIN_BG); row.pack(fill="x", padx=8, pady=2)
             sw = tk.Canvas(row, width=22, height=16, bg=colour,
@@ -706,48 +686,9 @@ class WaferMapTool(tk.Tk):
             lbl = tk.Label(row, text=label, font=("Segoe UI",8),
                            bg=WIN_BG, fg="#555")
             lbl.pack(side="left")
+            if char == '.':
+                self._legend_null_row = (sw, lbl)
         tk.Frame(lg, bg=WIN_BG, height=4).pack()
-
-    # ── canvas scroll / zoom ──────────────────────────────────────────────
-    def _on_canvas_scroll(self, event):
-        if event.state & 0x4:
-            self._on_canvas_zoom(event)
-            return
-        if event.num == 4:
-            self.canvas.yview_scroll(-1, "units")
-        elif event.num == 5:
-            self.canvas.yview_scroll(1, "units")
-        else:
-            self.canvas.yview_scroll(-1*(event.delta//120), "units")
-
-    def _on_canvas_zoom(self, event):
-        if event.num == 4 or (hasattr(event,'delta') and event.delta > 0):
-            factor = 1.15
-        else:
-            factor = 1/1.15
-
-        old_zoom = self.zoom
-        self.zoom = max(0.05, min(16.0, self.zoom * factor))
-        if abs(self.zoom - old_zoom) < 0.001:
-            return
-
-        cx = self.canvas.canvasx(event.x)
-        cy = self.canvas.canvasy(event.y)
-        ratio = self.zoom / old_zoom
-        self._schedule_redraw()
-        def _adjust():
-            sr = self.canvas.cget("scrollregion")
-            if not sr: return
-            _, _, sw, sh = map(float, sr.split())
-            new_cx = cx * ratio
-            new_cy = cy * ratio
-            vw = self.canvas.winfo_width()
-            vh = self.canvas.winfo_height()
-            fx = max(0.0, min(1.0, (new_cx - event.x) / sw))
-            fy = max(0.0, min(1.0, (new_cy - event.y) / sh))
-            self.canvas.xview_moveto(fx)
-            self.canvas.yview_moveto(fy)
-        self.after(60, _adjust)
 
     # ── bottom bar ────────────────────────────────────────────────────────
     def _build_bottom_bar(self):
@@ -788,8 +729,7 @@ class WaferMapTool(tk.Tk):
 
         self.progress = ttk.Progressbar(bar, mode="indeterminate", length=120)
 
-    def _set_status(self, msg): 
-        self.status_var.set(msg)
+    def _set_status(self, msg): self.status_var.set(msg)
 
     # ── open / load ───────────────────────────────────────────────────────
     def _open_file(self):
@@ -798,9 +738,8 @@ class WaferMapTool(tk.Tk):
             filetypes=[("Wafer map files","*.xlsx *.xls *.txt"),("Excel files","*.xlsx *.xls"),("Text files","*.txt"),("All files","*.*")])
         if not path: return
         self.filepath = path
-        import os as _os
-        self.breadcrumb.config(text=_os.path.basename(path))
-        self._set_status(f"Loading  {_os.path.basename(path)} …")
+        self.breadcrumb.config(text=os.path.basename(path))
+        self._set_status(f"Loading  {os.path.basename(path)} …")
         self.progress.pack(side="right", padx=6, pady=4)
         self.progress.start(10)
         threading.Thread(target=self._load_thread, daemon=True).start()
@@ -808,7 +747,7 @@ class WaferMapTool(tk.Tk):
     def _load_thread(self):
         t0 = time.time()
         try:
-            grid, designs, counts, sheet, fmt, null_char, source_kind, wafer_details, meta = \
+            grid, designs, counts, sheet, fmt, null_char, source_kind, meta = \
                 detect_and_parse(self.filepath)
 
             rows = len(grid)
@@ -839,20 +778,19 @@ class WaferMapTool(tk.Tk):
             }
 
             self.after(0, lambda: self._on_load_done(
-                grid, enc, sheet, fmt, null_char, source_kind, meta, wafer_details,
-                designs, counts, cm_rgb, cm_xlsx, rows, cols, fsize_s, elapsed,
+                grid, enc, sheet, fmt, null_char, source_kind, meta, designs, counts,
+                cm_rgb, cm_xlsx, rows, cols, fsize_s, elapsed,
                 fmt_labels.get(fmt, "Text Map (.txt)")))
         except Exception as e:
             import traceback
             self.after(0, lambda: self._on_load_error(str(e)+"\n"+traceback.format_exc()))
 
-    def _on_load_done(self, grid, enc, sheet, fmt, null_char, source_kind, meta, wafer_details,
-                      designs, counts, cm_rgb, cm_xlsx, rows, cols, fsize_s, elapsed, fmt_label):
+    def _on_load_done(self, grid, enc, sheet, fmt, null_char, source_kind, meta, designs, counts,
+                      cm_rgb, cm_xlsx, rows, cols, fsize_s, elapsed, fmt_label):
         self.progress.stop(); self.progress.pack_forget()
         self.grid_data=grid; self.enc=enc; self.source_sheet=sheet
         self.file_fmt=fmt; self.null_char=null_char
         self.source_kind=source_kind; self.source_meta=meta or {}
-        self.wafer_details=wafer_details
         self.designs=designs; self.design_counts=counts
         self.cm_rgb=cm_rgb; self.cm_xlsx=cm_xlsx
         self.selected_designs.clear(); self.zoom=1.0
@@ -875,10 +813,9 @@ class WaferMapTool(tk.Tk):
 
         self.breadcrumb.config(text=f"{fname}  [{sheet}]  ·  {fmt_label}")
         self._set_status(
-            f"✔  {fname}  ·  {len(designs)} designs detected  ·  {rows}×{cols}")
+            f"✔  {fname}  ·  {len(designs)} designs detected  ·  {rows}×{cols}  ·  {fmt_label}")
 
         self._populate_designs()
-        self._populate_wafer_details()
         self.export_btn.config(state="normal", bg=BLUE, fg="white")
         self.tb_export.config(state="normal", fg="#111", bg=WIN_BG, relief="flat")
         self.tb_export.bind("<Enter>",
@@ -893,53 +830,36 @@ class WaferMapTool(tk.Tk):
         self._set_status(f"Error loading file")
         messagebox.showerror("Load Error", msg)
 
-    # ── populate wafer details ────────────────────────────────────────────
-    def _populate_wafer_details(self):
-        for w in self.details_inner.winfo_children(): w.destroy()
-        
-        if not self.wafer_details:
-            self._details_empty = tk.Label(self.details_inner,
-                                            text="No wafer details found",
-                                            font=("Segoe UI",8,"italic"),
-                                            bg=WIN_BG, fg="#999")
-            self._details_empty.pack(pady=14)
-            return
-
-        for key, value in sorted(self.wafer_details.items()):
-            row = tk.Frame(self.details_inner, bg=WIN_BG)
-            row.pack(fill="x", padx=8, pady=2)
-            
-            tk.Label(row, text=key+":", font=("Segoe UI",8,"bold"),
-                     bg=WIN_BG, fg="#333", width=14, anchor="w").pack(side="left")
-            tk.Label(row, text=str(value), font=("Segoe UI",8),
-                     bg=WIN_BG, fg="#666", wraplength=200, justify="left").pack(side="left", fill="x", expand=True, padx=(4,0))
-
     # ── design list ───────────────────────────────────────────────────────
     def _populate_designs(self):
         for w in self.design_inner.winfo_children(): w.destroy()
         self.design_vars   = {}
-        self._hover_jobs   = {}
+        self._hover_jobs   = {}   # row_id → after-job for animation
 
-        HOV_BG   = (220, 234, 255)
+        # Colours used by the hover animation
+        HOV_BG   = (220, 234, 255)   # target hover bg  RGB
         NORM_BG  = tuple(int(WIN_BG.lstrip('#')[i:i+2],16) for i in (0,2,4))
         HOV_FG   = "#003070"
         NORM_FG  = "#111111"
         HOV_CNT  = "#0055cc"
         NORM_CNT = "#555555"
-        STEPS    = 6
-        DELAY    = 12
+        STEPS    = 6          # animation frames
+        DELAY    = 12         # ms between frames
 
         def _lerp_col(a, b, t):
+            """Linearly interpolate between two RGB tuples; return hex string."""
             r = int(a[0] + (b[0]-a[0])*t)
             g = int(a[1] + (b[1]-a[1])*t)
             bl= int(a[2] + (b[2]-a[2])*t)
             return f"#{r:02x}{g:02x}{bl:02x}"
 
         def _animate(row_id, row_frame, cb_widget, cnt_lbl, step, going_in):
+            """Animate one frame of the hover fade."""
             t = step / STEPS
             if not going_in:
                 t = 1.0 - t
             bg_hex = _lerp_col(NORM_BG, HOV_BG, t)
+            # left accent strip colour
             acc_hex = _lerp_col(NORM_BG, (0, 103, 192), t)
 
             try:
@@ -955,10 +875,11 @@ class WaferMapTool(tk.Tk):
                                     tuple(int(NORM_CNT.lstrip('#')[i:i+2],16) for i in (0,2,4)),
                                     tuple(int(HOV_CNT.lstrip('#')[i:i+2],16) for i in (0,2,4)),
                                     t))
+                # accent bar
                 acc_bar = row_frame._acc_bar
                 acc_bar.config(bg=acc_hex)
             except tk.TclError:
-                return
+                return   # widget was destroyed
 
             if step < STEPS:
                 job = row_frame.after(DELAY,
@@ -972,12 +893,13 @@ class WaferMapTool(tk.Tk):
             self.design_vars[design] = var
             count = self.design_counts.get(design, 0)
 
+            # Outer row with a thin left-accent bar
             row = tk.Frame(self.design_inner, bg=WIN_BG, cursor="hand2")
             row.pack(fill="x", padx=0, pady=0)
 
             acc = tk.Frame(row, width=3, bg=WIN_BG, cursor="hand2")
             acc.pack(side="left", fill="y")
-            row._acc_bar = acc
+            row._acc_bar = acc   # stash reference
 
             sw = tk.Canvas(row, width=14, height=13, bg=hex_col,
                            highlightthickness=1, highlightbackground=SEP_COL,
@@ -1013,6 +935,8 @@ class WaferMapTool(tk.Tk):
                 widget.bind("<Enter>", _enter)
                 widget.bind("<Leave>", _leave)
 
+            # Only bind click on non-checkbox widgets to avoid double-toggle
+            # (the Checkbutton handles its own click via command=)
             for widget in (row, acc, sw, cnt):
                 widget.bind("<Button-1>",
                     lambda e, v=var: [v.set(not v.get()), self._on_sel_change()])
@@ -1030,9 +954,11 @@ class WaferMapTool(tk.Tk):
         self.sel_names_var.set(", ".join(sorted(self.selected_designs)) if n else "—")
 
         en = "normal" if self.grid_data else "disabled"
+        # Bottom Export button
         self.export_btn.config(state=en,
                                 bg=BLUE if en == "normal" else WIN_BG,
                                 fg="white" if en == "normal" else "#aaaaaa")
+        # Toolbar Export button — restore hover bindings when enabled
         self.tb_export.config(state=en,
                                fg="#111" if en == "normal" else "#aaaaaa",
                                bg=WIN_BG, relief="flat")
@@ -1060,6 +986,7 @@ class WaferMapTool(tk.Tk):
 
     # ── rendering ─────────────────────────────────────────────────────────
     def _rebuild_luts(self):
+        """Build colour lookup tables for map and preview."""
         n   = len(self.designs)
         bg  = tuple(int(WIN_BG.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
         GREY = (190, 190, 190)
@@ -1220,6 +1147,7 @@ class WaferMapTool(tk.Tk):
     def _zoom_out(self):   self.zoom=max(self.zoom/1.5,.05); self._schedule_redraw()
     def _zoom_fit(self):   self.zoom=1.0; self._schedule_redraw()
 
+
     def _open_char_map_dialog(self):
         if not self.grid_data:
             messagebox.showinfo("No File", "Open a file first.")
@@ -1231,17 +1159,169 @@ class WaferMapTool(tk.Tk):
             self.char_map_special = dlg.result['special']
             self._set_status("Character mapping updated")
 
-    def _open_wafer_details_dialog(self):
-        """Open a dialog to view and edit wafer details"""
-        if not self.grid_data and not self.wafer_details:
-            messagebox.showinfo("No Details", "No wafer details found.")
+    def _open_field_layout_dialog(self):
+        if not self.grid_data:
+            messagebox.showinfo("No File", "Open a wafer map first.")
             return
-        dlg = WaferDetailsDialog(self, self.wafer_details)
+        dlg = FieldLayoutDialog(self)
         self.wait_window(dlg)
         if dlg.result:
-            self.wafer_details = dlg.result
-            self._populate_wafer_details()
-            self._set_status("Wafer details updated")
+            try:
+                self._apply_field_layout_conversion(dlg.result)
+            except Exception as e:
+                messagebox.showerror("Layout Conversion Error", str(e))
+
+    def _parse_row_bands(self, band_text, field_height):
+        """Parse row-band definitions.
+        Supported:
+          1:8      -> sequential count
+          2=7      -> sequential count
+          A=1-6    -> explicit local row range
+          B,7,12   -> explicit local row range
+        """
+        mapping = {}
+        next_row = 1
+        for raw in band_text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith('#'):
+                continue
+            m = re.match(r'^(.+?)\s*[:=]\s*(\d+)\s*-\s*(\d+)\s*$', line)
+            if m:
+                label, start, end = m.group(1).strip(), int(m.group(2)), int(m.group(3))
+            else:
+                m = re.match(r'^(.+?)\s*,\s*(\d+)\s*,\s*(\d+)\s*$', line)
+                if m:
+                    label, start, end = m.group(1).strip(), int(m.group(2)), int(m.group(3))
+                else:
+                    m = re.match(r'^(.+?)\s*(?:[:=]|x)\s*(\d+)\s*$', line, re.I)
+                    if not m:
+                        raise ValueError(f"Could not understand row-band line: {line!r}")
+                    label, count = m.group(1).strip(), int(m.group(2))
+                    start, end = next_row, next_row + count - 1
+                    next_row = end + 1
+            if start < 1 or end > field_height or end < start:
+                raise ValueError(f"Row range {start}-{end} is outside the field height 1-{field_height}.")
+            for rr in range(start, end + 1):
+                if rr in mapping:
+                    raise ValueError(f"Field row {rr} is assigned more than once.")
+                mapping[rr] = str(label)
+        if not mapping:
+            raise ValueError("Enter at least one row-band definition.")
+        return mapping
+
+    def _find_anchor_offset(self, cfg, field_w, field_h):
+        """Find field row/column 1 offsets using a rectangular drop-in."""
+        rows = len(self.grid_data)
+        cols = max(len(r) for r in self.grid_data) if self.grid_data else 0
+        fallback_row = int(cfg.get('row_offset', 1)) - 1
+        fallback_col = int(cfg.get('col_offset', 1)) - 1
+        if not cfg.get('use_anchor'):
+            return fallback_row % field_h, fallback_col % field_w, "manual offset"
+
+        local_r = int(cfg['anchor_local_row']) - 1
+        local_c = int(cfg['anchor_local_col']) - 1
+        ah = int(cfg['anchor_h'])
+        aw = int(cfg['anchor_w'])
+        achar = str(cfg.get('anchor_char', 'X'))
+        target = 'X' if achar in ('*', 'X') else achar
+
+        best = None
+        for r in range(0, max(0, rows - ah + 1)):
+            for c in range(0, max(0, cols - aw + 1)):
+                ok = True
+                for yy in range(ah):
+                    grow = self.grid_data[r + yy]
+                    if c + aw > len(grow):
+                        ok = False
+                        break
+                    for xx in range(aw):
+                        if grow[c + xx] != target:
+                            ok = False
+                            break
+                    if not ok:
+                        break
+                if ok:
+                    best = (r, c)
+                    break
+            if best:
+                break
+
+        if not best:
+            raise ValueError(
+                f"Could not find a {aw}×{ah} block of {achar!r}. "
+                "Use manual offset, or check the anchor size/location."
+            )
+        r, c = best
+        row_offset = (r - local_r) % field_h
+        col_offset = (c - local_c) % field_w
+        msg = f"anchor found at map row {r+1}, col {c+1}; field row 1 offset row {row_offset+1}, col {col_offset+1}"
+        return row_offset, col_offset, msg
+
+    def _apply_field_layout_conversion(self, cfg):
+        field_w = int(cfg['field_w'])
+        field_h = int(cfg['field_h'])
+        if field_w <= 0 or field_h <= 0:
+            raise ValueError("Field width and field height must be positive integers.")
+
+        row_map = self._parse_row_bands(cfg['bands'], field_h)
+        row_offset, col_offset, align_msg = self._find_anchor_offset(cfg, field_w, field_h)
+
+        new_grid = []
+        counts = Counter()
+        for r, row in enumerate(self.grid_data):
+            local_r = ((r - row_offset) % field_h) + 1
+            label = row_map.get(local_r)
+            out = []
+            for c, val in enumerate(row):
+                if val in ('.', 'X', 'x', None):
+                    out.append(val)
+                else:
+                    new_val = str(label) if label is not None else str(val)
+                    out.append(new_val)
+                    if label is not None:
+                        counts[new_val] += 1
+            new_grid.append(out)
+
+        self.grid_data = new_grid
+        self.design_counts = dict(counts)
+        self.designs = _sort_designs(list(counts.keys()))
+
+        rows = len(new_grid)
+        cols = max(len(r) for r in new_grid) if new_grid else 0
+        didx = {d: i + 1 for i, d in enumerate(self.designs)}
+        flat = []
+        for row in new_grid:
+            for val in row:
+                if   val == '.': flat.append(0)
+                elif val == 'X': flat.append(-1)
+                elif val == 'x': flat.append(-2)
+                else:            flat.append(didx.get(str(val), 0))
+            flat.extend([0] * (cols - len(row)))
+        self.enc = np.array(flat, dtype=np.int16).reshape(rows, cols)
+
+        self.cm_rgb  = {d: PAL_RGB[i % len(PAL_RGB)]  for i, d in enumerate(self.designs)}
+        self.cm_xlsx = {d: PAL_XLSX[i % len(PAL_XLSX)] for i, d in enumerate(self.designs)}
+        self.selected_designs.clear()
+        self.char_map_designs = {d: str(d) for d in self.designs}
+        if not self.char_map_special:
+            self.char_map_special = {
+                'selected': '1',
+                'unselected': 'x',
+                'null': '.',
+                'edge': '*' if self.source_kind == 'txt' else 'X',
+            }
+        self._lut = None
+        self._prev_lut = None
+        self._lut_dirty = True
+
+        self.stat_vars["Total Die:"].set(f"{sum(counts.values()):,}")
+        self._populate_designs()
+        self._render_map()
+        self._render_preview()
+        self._set_status(
+            f"Field layout conversion complete · {field_w}×{field_h} · "
+            f"{len(self.designs)} designs · {align_msg}"
+        )
 
     def _map_output_char(self, cell_val):
         if cell_val == '.':
@@ -1393,7 +1473,6 @@ class WaferMapTool(tk.Tk):
             return
         self.filepath=None; self.grid_data=[]; self.enc=None
         self.source_kind='xlsx'; self.source_meta={}
-        self.wafer_details={}
         self.designs=[]; self.design_counts={}
         self.selected_designs.clear(); self.design_vars={}; self._hover_jobs={}; self.zoom=1.0; self.prev_zoom=1.0
         self.char_map_designs={}; self.char_map_special={}
@@ -1401,10 +1480,6 @@ class WaferMapTool(tk.Tk):
         self.breadcrumb.config(text="No file loaded")
         for w in self.design_inner.winfo_children(): w.destroy()
         tk.Label(self.design_inner, text="Open a file to detect designs",
-                 font=("Segoe UI",8,"italic"),
-                 bg=WIN_BG, fg="#999").pack(pady=14)
-        for w in self.details_inner.winfo_children(): w.destroy()
-        tk.Label(self.details_inner, text="No details loaded",
                  font=("Segoe UI",8,"italic"),
                  bg=WIN_BG, fg="#999").pack(pady=14)
         for k in self.stat_vars: self.stat_vars[k].set("—")
@@ -1423,87 +1498,6 @@ class WaferMapTool(tk.Tk):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  WAFER DETAILS DIALOG
-# ═══════════════════════════════════════════════════════════════════════
-class WaferDetailsDialog(tk.Toplevel):
-    def __init__(self, parent, wafer_details):
-        super().__init__(parent)
-        self.title("Edit Wafer Details")
-        self.resizable(True, True)
-        self.grab_set()
-        self.result = None
-        self.configure(bg=WIN_BG)
-        x = parent.winfo_x() + parent.winfo_width()//2 - 310
-        y = parent.winfo_y() + parent.winfo_height()//2 - 280
-        self.geometry(f"620x560+{x}+{y}")
-
-        hdr = tk.Frame(self, bg=BLUE)
-        hdr.pack(fill="x")
-        tk.Label(hdr, text="  Wafer Details",
-                 font=("Segoe UI",11,"bold"),
-                 bg=BLUE, fg="white", pady=9).pack(side="left")
-
-        body = tk.Frame(self, bg=WIN_BG)
-        body.pack(fill="both", expand=True, padx=14, pady=12)
-
-        tk.Label(body,
-                 text="Edit wafer metadata. Leave blank to remove a field.",
-                 justify="left",
-                 font=("Segoe UI",8), bg=WIN_BG, fg="#555").pack(anchor="w", pady=(0,8))
-
-        # Scrollable details editor
-        sf = tk.Frame(body, bg=WIN_BG)
-        sf.pack(fill="both", expand=True, pady=(0,10))
-        canvas = tk.Canvas(sf, bg=WIN_BG, highlightthickness=0)
-        vsb = ttk.Scrollbar(sf, orient="vertical", command=canvas.yview)
-        inner = tk.Frame(canvas, bg=WIN_BG)
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-        canvas.create_window((0,0), window=inner, anchor="nw")
-        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-
-        self.detail_vars = {}
-        
-        # Standard fields
-        standard_keys = ['WAFER_ID', 'LOT_ID', 'WAFER_SIZE', 'X_SIZE', 'Y_SIZE', 'FLAT_NOTCH', 'DIES', 'BIN']
-        all_keys = list(dict.fromkeys(standard_keys + list(wafer_details.keys())))
-        
-        for key in all_keys:
-            row = tk.Frame(inner, bg=WIN_BG)
-            row.pack(fill="x", pady=3)
-            tk.Label(row, text=key+":", width=14, anchor="w", bg=WIN_BG, font=("Segoe UI",9)).pack(side="left")
-            ent = tk.Entry(row, width=40, font=("Segoe UI", 9))
-            ent.pack(side="left", padx=(0,8), fill="x", expand=True)
-            ent.insert(0, wafer_details.get(key, ''))
-            self.detail_vars[key] = ent
-
-        btns = tk.Frame(body, bg=WIN_BG)
-        btns.pack(fill="x")
-
-        tk.Button(btns, text="Cancel", command=self.destroy,
-                  font=("Segoe UI",9), relief="raised", bd=2,
-                  bg=WIN_BG, padx=10, pady=4, cursor="hand2").pack(side="right", padx=(6,0))
-        tk.Button(btns, text="Save", command=self._ok,
-                  font=("Segoe UI",9,"bold"), relief="raised", bd=2,
-                  bg=BLUE, fg="white", activebackground=BLUE_HOV,
-                  activeforeground="white", padx=14, pady=4,
-                  cursor="hand2").pack(side="right")
-
-        self.bind("<Return>", lambda e: self._ok())
-        self.bind("<Escape>", lambda e: self.destroy())
-
-    def _ok(self):
-        result = {}
-        for key, ent in self.detail_vars.items():
-            value = ent.get().strip()
-            if value:
-                result[key] = value
-        self.result = result
-        self.destroy()
-
-
-# ═══════════════════════════════════════════════════════════════════════
 #  EXPORT DIALOG
 # ═══════════════════════════════════════════════════════════════════════
 class ExportDialog(tk.Toplevel):
@@ -1518,6 +1512,7 @@ class ExportDialog(tk.Toplevel):
         y = parent.winfo_y() + parent.winfo_height()//2 - 175
         self.geometry(f"420x370+{x}+{y}")
 
+        # blue header strip
         hdr = tk.Frame(self, bg=BLUE)
         hdr.pack(fill="x")
         tk.Label(hdr, text="  Export Wafer Map",
@@ -1527,6 +1522,7 @@ class ExportDialog(tk.Toplevel):
         body = tk.Frame(self, bg=WIN_BG)
         body.pack(fill="both", padx=18, pady=10)
 
+        # info box
         ib = tk.Frame(body, bg="#deeaf7", relief="solid", bd=1)
         ib.pack(fill="x", pady=(0,12))
         export_label = ', '.join(designs) if designs else 'All detected designs'
@@ -1600,6 +1596,171 @@ class ExportDialog(tk.Toplevel):
 
     def _ok(self):
         self.result = {"fmt":self.fmt.get(), "le":self.le.get()}
+        self.destroy()
+
+
+class FieldLayoutDialog(tk.Toplevel):
+    """Convert a single-bin wafer mask into repeated field-row design labels."""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Field Layout Conversion")
+        self.resizable(True, True)
+        self.grab_set()
+        self.result = None
+        self.configure(bg=WIN_BG)
+
+        x = parent.winfo_x() + parent.winfo_width()//2 - 310
+        y = parent.winfo_y() + parent.winfo_height()//2 - 300
+        self.geometry(f"620x650+{x}+{y}")
+
+        hdr = tk.Frame(self, bg=BLUE)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="  Field Layout Conversion",
+                 font=("Segoe UI",11,"bold"),
+                 bg=BLUE, fg="white", pady=9).pack(side="left")
+
+        body = tk.Frame(self, bg=WIN_BG)
+        body.pack(fill="both", expand=True, padx=14, pady=12)
+
+        tk.Label(body,
+                 text=("Convert a single-bin wafer mask into design labels by repeating a field layout. "
+                       "Enter the field size, row bands, and optionally a drop-in anchor."),
+                 justify="left", wraplength=575,
+                 font=("Segoe UI",8), bg=WIN_BG, fg="#555").pack(anchor="w", pady=(0,8))
+
+        geo = ttk.LabelFrame(body, text=" Field geometry ")
+        geo.pack(fill="x", pady=(0,8))
+        self.field_w = self._entry_row(geo, "Field width / dies across", "50")
+        self.field_h = self._entry_row(geo, "Field height / dies down", "64")
+        self.row_offset = self._entry_row(geo, "Manual field row 1 starts at map row", "1")
+        self.col_offset = self._entry_row(geo, "Manual field col 1 starts at map col", "1")
+
+        bands_box = ttk.LabelFrame(body, text=" Row bands ")
+        bands_box.pack(fill="both", expand=True, pady=(0,8))
+        tk.Label(bands_box,
+                 text=("Sequential format: design:count   e.g. 1:8, 2:7.\n"
+                       "Range format also works: A=1-6 or B,7,12."),
+                 font=("Segoe UI",8), bg=WIN_BG, fg="#555",
+                 justify="left").pack(anchor="w", padx=8, pady=(5,2))
+        self.bands = tk.Text(bands_box, height=11, font=("Consolas", 10), wrap="none")
+        self.bands.pack(fill="both", expand=True, padx=8, pady=(0,8))
+        self.bands.insert("1.0", "1:8\n2:7\n3:7\n4:7\n5:7\n6:7\n7:7\n8:7\n9:7")
+
+        anchor = ttk.LabelFrame(body, text=" Optional drop-in anchor ")
+        anchor.pack(fill="x", pady=(0,8))
+        self.use_anchor = tk.BooleanVar(value=True)
+        tk.Checkbutton(anchor, text="Auto-align using a rectangular drop-in block",
+                       variable=self.use_anchor, bg=WIN_BG,
+                       activebackground=WIN_BG, selectcolor=WIN_BG,
+                       font=("Segoe UI",9)).pack(anchor="w", padx=8, pady=(5,2))
+        grid = tk.Frame(anchor, bg=WIN_BG)
+        grid.pack(fill="x", padx=8, pady=(0,6))
+        self.anchor_local_row = self._grid_entry(grid, 0, "Drop-in top local row", "30")
+        self.anchor_local_col = self._grid_entry(grid, 1, "Drop-in left local col", "21")
+        self.anchor_w         = self._grid_entry(grid, 2, "Drop-in width", "10")
+        self.anchor_h         = self._grid_entry(grid, 3, "Drop-in height", "8")
+        self.anchor_char      = self._grid_entry(grid, 4, "Drop-in char", "X")
+
+        presets = tk.Frame(body, bg=WIN_BG)
+        presets.pack(fill="x", pady=(0,8))
+        tk.Button(presets, text="SCR10 preset", command=self._preset_scr10,
+                  font=("Segoe UI",8), relief="raised", bd=2,
+                  bg=WIN_BG, padx=8).pack(side="left", padx=(0,6))
+        tk.Button(presets, text="TVST A–P preset", command=self._preset_tvst,
+                  font=("Segoe UI",8), relief="raised", bd=2,
+                  bg=WIN_BG, padx=8).pack(side="left")
+
+        btns = tk.Frame(body, bg=WIN_BG)
+        btns.pack(fill="x")
+        tk.Button(btns, text="Cancel", command=self.destroy,
+                  font=("Segoe UI",9), relief="raised", bd=2,
+                  bg=WIN_BG, padx=10, pady=4,
+                  cursor="hand2").pack(side="right", padx=(6,0))
+        tk.Button(btns, text="Apply Conversion", command=self._ok,
+                  font=("Segoe UI",9,"bold"), relief="raised", bd=2,
+                  bg=BLUE, fg="white", activebackground=BLUE_HOV,
+                  activeforeground="white", padx=14, pady=4,
+                  cursor="hand2").pack(side="right")
+
+    def _entry_row(self, parent, label, default):
+        row = tk.Frame(parent, bg=WIN_BG)
+        row.pack(fill="x", padx=8, pady=2)
+        tk.Label(row, text=label, width=32, anchor="w",
+                 bg=WIN_BG, font=("Segoe UI",9)).pack(side="left")
+        ent = tk.Entry(row, width=10, font=("Consolas", 10))
+        ent.insert(0, default)
+        ent.pack(side="left")
+        return ent
+
+    def _grid_entry(self, parent, r, label, default):
+        tk.Label(parent, text=label, bg=WIN_BG,
+                 font=("Segoe UI",8), anchor="w").grid(row=r, column=0, sticky="w", pady=1)
+        ent = tk.Entry(parent, width=10, font=("Consolas", 9))
+        ent.insert(0, default)
+        ent.grid(row=r, column=1, sticky="w", padx=(8,20), pady=1)
+        return ent
+
+    def _set_entry(self, ent, value):
+        ent.delete(0, 'end')
+        ent.insert(0, str(value))
+
+    def _preset_scr10(self):
+        self._set_entry(self.field_w, 50)
+        self._set_entry(self.field_h, 64)
+        self._set_entry(self.row_offset, 1)
+        self._set_entry(self.col_offset, 1)
+        self.use_anchor.set(True)
+        self._set_entry(self.anchor_local_row, 30)
+        self._set_entry(self.anchor_local_col, 21)
+        self._set_entry(self.anchor_w, 10)
+        self._set_entry(self.anchor_h, 8)
+        self._set_entry(self.anchor_char, 'X')
+        self.bands.delete('1.0', 'end')
+        self.bands.insert('1.0', "1:8\n2:7\n3:7\n4:7\n5:7\n6:7\n7:7\n8:7\n9:7")
+
+    def _preset_tvst(self):
+        self._set_entry(self.field_w, 28)
+        self._set_entry(self.field_h, 71)
+        self._set_entry(self.row_offset, 1)
+        self._set_entry(self.col_offset, 1)
+        self.use_anchor.set(True)
+        self._set_entry(self.anchor_local_row, 1)
+        self._set_entry(self.anchor_local_col, 13)
+        self._set_entry(self.anchor_w, 2)
+        self._set_entry(self.anchor_h, 2)
+        self._set_entry(self.anchor_char, '*')
+        self.bands.delete('1.0', 'end')
+        self.bands.insert('1.0', "A:6\nB:6\nC:6\nD:6\nE:6\nF:6\nG:6\nH:6\nI:6\nJ:6\nK:6\nL:1\nM:1\nN:1\nO:1\nP:1")
+
+    def _as_int(self, ent, name):
+        try:
+            return int(ent.get().strip())
+        except Exception:
+            raise ValueError(f"{name} must be an integer.")
+
+    def _ok(self):
+        try:
+            cfg = {
+                'field_w': self._as_int(self.field_w, 'Field width'),
+                'field_h': self._as_int(self.field_h, 'Field height'),
+                'row_offset': self._as_int(self.row_offset, 'Manual row offset'),
+                'col_offset': self._as_int(self.col_offset, 'Manual column offset'),
+                'bands': self.bands.get('1.0', 'end').strip(),
+                'use_anchor': bool(self.use_anchor.get()),
+                'anchor_local_row': self._as_int(self.anchor_local_row, 'Drop-in top local row'),
+                'anchor_local_col': self._as_int(self.anchor_local_col, 'Drop-in left local column'),
+                'anchor_w': self._as_int(self.anchor_w, 'Drop-in width'),
+                'anchor_h': self._as_int(self.anchor_h, 'Drop-in height'),
+                'anchor_char': self.anchor_char.get().strip() or 'X',
+            }
+            if cfg['field_w'] <= 0 or cfg['field_h'] <= 0:
+                raise ValueError("Field width and field height must be positive.")
+            if cfg['anchor_w'] <= 0 or cfg['anchor_h'] <= 0:
+                raise ValueError("Drop-in width and height must be positive.")
+        except Exception as e:
+            messagebox.showwarning("Invalid layout", str(e))
+            return
+        self.result = cfg
         self.destroy()
 
 
