@@ -1,5 +1,10 @@
 """
-Wafer Design Picker Tool  v1
+Wafer Design Picker Tool  v2
+Enhanced with Wafer Details Editor
+
+Separates wafer metadata (WAFER MAP = {...}) from the grid display,
+allowing independent viewing and editing of wafer parameters.
+
 Universal format detection — supports all known SCR file variants.
 
 Detected formats
@@ -149,15 +154,18 @@ def _fast_read_xlsx(filepath):
 
 
 def _read_text_map(filepath):
-    """Read a text wafer map. Supports either:
-      - raw grid text (one row per line), or
-      - wrapped wafer-map files containing MAP = { ... }
-    Returns (raw, sheet_name, meta) where raw is list[list[str]].
-    meta stores wrapper/header/footer info for round-trip txt export.
+    """
+    Read a text wafer map. Extracts two parts:
+      1. Wafer details (MAP = { ... })
+      2. Grid data (the actual map)
+    
+    Returns (grid, sheet_name, wafer_details, meta)
+    wafer_details is dict of {key: value} pairs from the MAP wrapper
     """
     with open(filepath, 'r', encoding='utf-8-sig', errors='replace') as f:
         lines = f.read().splitlines()
 
+    # Find the MAP = { ... } wrapper
     start_idx = None
     end_idx = None
     for i, line in enumerate(lines):
@@ -165,26 +173,47 @@ def _read_text_map(filepath):
             start_idx = i
             break
 
+    wafer_details = {}
+    prefix_lines = []
+    suffix_lines = []
+    map_lines = []
+
     if start_idx is not None:
+        # Extract wafer metadata (before the grid)
         for j in range(start_idx + 1, len(lines)):
             if lines[j].strip() == '}':
                 end_idx = j
                 break
+            # Parse key=value lines
+            line = lines[j].strip()
+            if line and not line.startswith('MAP'):
+                match = re.match(r'([A-Z_]+)\s*=\s*"?([^"]*)"?', line)
+                if match:
+                    key = match.group(1)
+                    val = match.group(2)
+                    wafer_details[key] = val
 
-    if start_idx is not None and end_idx is not None and end_idx > start_idx:
-        map_lines = lines[start_idx + 1:end_idx]
         prefix_lines = lines[:start_idx + 1]
-        suffix_lines = lines[end_idx:]
-        sheet_name = 'MAP'
+        if end_idx is not None:
+            # Everything after MAP = { and before the final }
+            map_start = None
+            for j in range(start_idx + 1, end_idx):
+                if lines[j].strip().startswith('MAP'):
+                    map_start = j + 1
+                    break
+            if map_start:
+                map_lines = lines[map_start:end_idx]
+            suffix_lines = lines[end_idx:]
     else:
         map_lines = lines
-        prefix_lines = []
-        suffix_lines = []
         sheet_name = os.path.splitext(os.path.basename(filepath))[0]
 
+    # Clean map lines
     map_lines = [ln.rstrip('\r\n') for ln in map_lines if ln.strip() != '']
     width = max((len(ln) for ln in map_lines), default=0)
-    raw = [list(ln.ljust(width)) for ln in map_lines]
+    grid = [list(ln.ljust(width)) for ln in map_lines]
+
+    sheet_name = wafer_details.get('WAFER_ID', os.path.splitext(os.path.basename(filepath))[0])
 
     meta = {
         'type': 'txt',
@@ -192,7 +221,7 @@ def _read_text_map(filepath):
         'suffix_lines': suffix_lines,
         'had_wrapper': bool(prefix_lines or suffix_lines),
     }
-    return raw, sheet_name, meta
+    return grid, sheet_name, wafer_details, meta
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -208,16 +237,18 @@ def detect_and_parse(filepath):
       fmt         : 'A' | 'B' | 'C' | 'TXT'
       null_char   : str         — original null character found in file
       source_kind : str         — 'xlsx' or 'txt'
+      wafer_details: dict       — metadata from wrapper (if txt)
       meta        : dict        — optional source metadata for export
     """
     ext = os.path.splitext(filepath)[1].lower()
     source_kind = 'txt' if ext == '.txt' else 'xlsx'
     meta = {'type': source_kind}
+    wafer_details = {}
 
     if source_kind == 'txt':
-        raw, sheet_name, meta = _read_text_map(filepath)
+        grid, sheet_name, wafer_details, meta = _read_text_map(filepath)
 
-        non_null = [c for row in raw for c in row if c not in (None, '')]
+        non_null = [c for row in grid for c in row if c not in (None, '')]
         val_counts = Counter(non_null)
         if val_counts.get('*', 0) > 0:
             edge_chars = {'*', 'X'}
@@ -232,7 +263,7 @@ def detect_and_parse(filepath):
             null_chars = {'.', ' '}
             null_char = '.'
 
-        grid = _normalise_grid(raw, null_chars=null_chars, edge_chars=edge_chars)
+        grid = _normalise_grid(grid, null_chars=null_chars, edge_chars=edge_chars)
         fmt = 'TXT'
     else:
         raw, sheet_name = _fast_read_xlsx(filepath)
@@ -277,7 +308,7 @@ def detect_and_parse(filepath):
 
     designs = _sort_designs(list(counts.keys()))
 
-    return grid, designs, dict(counts), sheet_name, fmt, null_char, source_kind, meta
+    return grid, designs, dict(counts), sheet_name, fmt, null_char, source_kind, wafer_details, meta
 
 
 def _normalise_grid(raw, null_chars, edge_chars):
@@ -331,8 +362,8 @@ def _sort_designs(design_list):
 class WaferMapTool(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Design Picker")
-        self.minsize(1200, 700)
+        self.title("Design Picker v2")
+        self.minsize(1400, 750)
         self.configure(bg=WIN_BG)
         self.state("zoomed")   # maximised on Windows; harmless on others
 
@@ -355,6 +386,7 @@ class WaferMapTool(tk.Tk):
         self.null_char        = '.'
         self.source_kind      = 'xlsx'
         self.source_meta      = {}
+        self.wafer_details    = {}
         self.grid_data        = []
         self.enc              = None
         self.designs          = []
@@ -369,11 +401,11 @@ class WaferMapTool(tk.Tk):
         self.zoom             = 1.0
         self._photo           = None
         self._pending         = False
-        self.prev_zoom        = 1.0   # zoom for preview canvas
-        self._prev_photo      = None  # keep reference
-        self._lut             = None  # colour lookup table (map)
-        self._prev_lut        = None  # colour lookup table (preview)
-        self._lut_dirty       = True  # rebuild LUT on next render
+        self.prev_zoom        = 1.0
+        self._prev_photo      = None
+        self._lut             = None
+        self._prev_lut        = None
+        self._lut_dirty       = True
 
         self._build_menu()
         self._build_toolbar()
@@ -396,7 +428,8 @@ class WaferMapTool(tk.Tk):
         hm = tk.Menu(mb, tearoff=0)
         hm.add_command(label="About", command=lambda: messagebox.showinfo(
             "About",
-            "Design Picker\n\n"
+            "Design Picker v2\n\n"
+            "Enhanced with Wafer Details Editor\n\n"
             "Supports all SCR wafer map formats:\n"
             "  Format A  —  null='.', edge='X'\n"
             "  Format B  —  null='-', edge='X'\n"
@@ -416,7 +449,6 @@ class WaferMapTool(tk.Tk):
                           cursor="hand2", fg="#111")
             if w:
                 b.config(width=w)
-            # Smooth hover: blue tint in, fade out
             def _hov_in(e, _b=b):
                 if str(_b.cget("state")) != "disabled":
                     _b.config(bg="#d9e8f5", fg="#0055aa", relief="groove")
@@ -436,6 +468,7 @@ class WaferMapTool(tk.Tk):
         btn("📂  Open",      self._open_file,  sep_after=True)
         btn("⟳  Refresh",   self._do_convert)
         btn("🔤  Chars",    self._open_char_map_dialog)
+        btn("📋 Details",   self._open_wafer_details_dialog, sep_after=True)
         btn("💾  Export",    self._export,      sep_after=True, tag="tb_export")
         self.tb_export.config(state="disabled", fg="#aaaaaa")
 
@@ -443,11 +476,8 @@ class WaferMapTool(tk.Tk):
         btn("🔍−  Zoom Out", self._zoom_out)
         btn("⊞  Fit",        self._zoom_fit,   sep_after=True)
 
-        # Select All / None shortcut buttons in toolbar
         btn("☑  All",        self._select_all)
         btn("☐  None",       self._select_none, sep_after=True)
-
-        # Reset button in toolbar
         btn("↺  Reset",      self._reset)
 
         self.show_grid = tk.BooleanVar(value=False)
@@ -473,11 +503,17 @@ class WaferMapTool(tk.Tk):
         body = tk.Frame(self, bg=WIN_BG)
         body.pack(fill="both", expand=True, padx=6, pady=(4,0))
 
-        # ── outer PanedWindow: [centre area] | [right panel] ─────────────
+        # Outer PanedWindow: [left: file info + designs] | [centre: map] | [right: preview + details]
         outer_pane = ttk.PanedWindow(body, orient="horizontal")
         outer_pane.pack(fill="both", expand=True)
 
-        # ── centre PanedWindow: [map] | [txt preview] ────────────────────
+        # ── LEFT PANEL: File info + Designs ────────────────────────────
+        left = tk.Frame(outer_pane, bg=WIN_BG, width=280)
+        left.pack_propagate(False)
+        outer_pane.add(left, weight=0)
+        self._build_left(left)
+
+        # ── CENTRE PanedWindow: [map] | [preview] ────────────────────
         centre_pane = ttk.PanedWindow(outer_pane, orient="horizontal")
         outer_pane.add(centre_pane, weight=3)
 
@@ -496,15 +532,14 @@ class WaferMapTool(tk.Tk):
         self.canvas.pack(fill="both", expand=True, padx=2, pady=2)
         self._draw_placeholder()
 
-        # Bind mouse-wheel zoom: Ctrl+scroll anywhere on canvas
         self.canvas.bind("<MouseWheel>",          self._on_canvas_scroll)
-        self.canvas.bind("<Button-4>",            self._on_canvas_scroll)  # Linux scroll up
-        self.canvas.bind("<Button-5>",            self._on_canvas_scroll)  # Linux scroll down
+        self.canvas.bind("<Button-4>",            self._on_canvas_scroll)
+        self.canvas.bind("<Button-5>",            self._on_canvas_scroll)
         self.canvas.bind("<Control-MouseWheel>",  self._on_canvas_zoom)
         self.canvas.bind("<Control-Button-4>",    self._on_canvas_zoom)
         self.canvas.bind("<Control-Button-5>",    self._on_canvas_zoom)
 
-        # Preview canvas — shows selected design only (same style as map)
+        # Preview canvas
         prev_card = ttk.LabelFrame(centre_pane,
                                     text=" Selected Design Preview ",
                                     labelanchor="nw")
@@ -520,7 +555,6 @@ class WaferMapTool(tk.Tk):
         self.prev_canvas.pack(fill="both", expand=True, padx=2, pady=2)
         self._draw_prev_placeholder()
 
-        # Same scroll/zoom bindings as the main canvas
         self.prev_canvas.bind("<MouseWheel>",         self._on_prev_scroll)
         self.prev_canvas.bind("<Button-4>",           self._on_prev_scroll)
         self.prev_canvas.bind("<Button-5>",           self._on_prev_scroll)
@@ -528,58 +562,14 @@ class WaferMapTool(tk.Tk):
         self.prev_canvas.bind("<Control-Button-4>",   self._on_prev_zoom)
         self.prev_canvas.bind("<Control-Button-5>",   self._on_prev_zoom)
 
-        # Right panel (fixed 270px)
-        right = tk.Frame(outer_pane, bg=WIN_BG, width=270)
+        # RIGHT PANEL: Details ─────────────────────────────────────────
+        right = tk.Frame(outer_pane, bg=WIN_BG, width=320)
         right.pack_propagate(False)
         outer_pane.add(right, weight=0)
         self._build_right(right)
 
-    # ── canvas scroll / zoom ──────────────────────────────────────────────
-    def _on_canvas_scroll(self, event):
-        """Plain scroll → pan vertically (Ctrl held → zoom instead)."""
-        if event.state & 0x4:          # Ctrl key is down
-            self._on_canvas_zoom(event)
-            return
-        # pan
-        if event.num == 4:
-            self.canvas.yview_scroll(-1, "units")
-        elif event.num == 5:
-            self.canvas.yview_scroll(1, "units")
-        else:
-            self.canvas.yview_scroll(-1*(event.delta//120), "units")
-
-    def _on_canvas_zoom(self, event):
-        """Ctrl+scroll → zoom in/out centred on mouse position."""
-        if event.num == 4 or (hasattr(event,'delta') and event.delta > 0):
-            factor = 1.15
-        else:
-            factor = 1/1.15
-
-        old_zoom = self.zoom
-        self.zoom = max(0.05, min(16.0, self.zoom * factor))
-        if abs(self.zoom - old_zoom) < 0.001:
-            return
-
-        # keep the point under the cursor fixed after zoom
-        cx = self.canvas.canvasx(event.x)
-        cy = self.canvas.canvasy(event.y)
-        ratio = self.zoom / old_zoom
-        self._schedule_redraw()
-        def _adjust():
-            sr = self.canvas.cget("scrollregion")
-            if not sr: return
-            _, _, sw, sh = map(float, sr.split())
-            new_cx = cx * ratio
-            new_cy = cy * ratio
-            vw = self.canvas.winfo_width()
-            vh = self.canvas.winfo_height()
-            fx = max(0.0, min(1.0, (new_cx - event.x) / sw))
-            fy = max(0.0, min(1.0, (new_cy - event.y) / sh))
-            self.canvas.xview_moveto(fx)
-            self.canvas.yview_moveto(fy)
-        self.after(60, _adjust)
-
-    def _build_right(self, parent):
+    def _build_left(self, parent):
+        """File info + Designs panel"""
         # ── File Info ────────────────────────────────────────────────────
         fi = ttk.LabelFrame(parent, text=" File Info ", labelanchor="nw")
         fi.pack(fill="x", padx=0, pady=(0,6))
@@ -600,7 +590,6 @@ class WaferMapTool(tk.Tk):
         dc = ttk.LabelFrame(parent, text=" Designs ", labelanchor="nw")
         dc.pack(fill="both", expand=True, padx=0, pady=(0,6))
 
-        # column headers
         hdr = tk.Frame(dc, bg=HDR_BG); hdr.pack(fill="x")
         tk.Label(hdr, text="  Design", font=("Segoe UI",8,"bold"),
                  bg=HDR_BG, width=12, anchor="w").pack(side="left", padx=(20,0), pady=3)
@@ -608,7 +597,6 @@ class WaferMapTool(tk.Tk):
                  bg=HDR_BG, anchor="e").pack(side="right", padx=8)
         ttk.Separator(dc).pack(fill="x")
 
-        # scrollable list
         lc = tk.Canvas(dc, bg=WIN_BG, highlightthickness=0, bd=0)
         ls = ttk.Scrollbar(dc, orient="vertical", command=lc.yview)
         lc.configure(yscrollcommand=ls.set)
@@ -631,7 +619,6 @@ class WaferMapTool(tk.Tk):
 
         ttk.Separator(dc).pack(fill="x")
 
-        # All / None + count
         bot = tk.Frame(dc, bg=WIN_BG); bot.pack(fill="x", padx=8, pady=5)
         tk.Button(bot, text="All",  command=self._select_all,
                   font=("Segoe UI",8), relief="raised", bd=2,
@@ -644,6 +631,8 @@ class WaferMapTool(tk.Tk):
                                        bg=WIN_BG, fg="#555")
         self.sel_count_lbl.pack(side="right")
 
+    def _build_right(self, parent):
+        """Wafer Details panel"""
         # ── Selection Summary ─────────────────────────────────────────────
         sc = ttk.LabelFrame(parent, text=" Selection ", labelanchor="nw")
         sc.pack(fill="x", padx=0, pady=(0,6))
@@ -662,18 +651,51 @@ class WaferMapTool(tk.Tk):
         self.sel_names_var = tk.StringVar(value="—")
         tk.Label(r2, textvariable=self.sel_names_var,
                  font=("Segoe UI",8), bg=WIN_BG, fg="#333",
-                 wraplength=158, justify="left").pack(side="left")
+                 wraplength=248, justify="left").pack(side="left")
+
+        # ── Wafer Details ─────────────────────────────────────────────────
+        wd = ttk.LabelFrame(parent, text=" Wafer Details ", labelanchor="nw")
+        wd.pack(fill="both", expand=True, padx=0, pady=(0,6))
+
+        # Scrollable details list
+        wc = tk.Canvas(wd, bg=WIN_BG, highlightthickness=0, bd=0)
+        ws = ttk.Scrollbar(wd, orient="vertical", command=wc.yview)
+        wc.configure(yscrollcommand=ws.set)
+        ws.pack(side="right", fill="y", padx=(0,2), pady=2)
+        wc.pack(side="left", fill="both", expand=True)
+        wc.bind("<MouseWheel>",
+            lambda e: wc.yview_scroll(-1*(e.delta//120),"units"))
+        self._details_canvas = wc
+
+        self.details_inner = tk.Frame(wc, bg=WIN_BG)
+        wc.create_window((0,0), window=self.details_inner, anchor="nw")
+        self.details_inner.bind("<Configure>",
+            lambda e: wc.configure(scrollregion=wc.bbox("all")))
+
+        self._details_empty = tk.Label(self.details_inner,
+                                        text="No details loaded",
+                                        font=("Segoe UI",8,"italic"),
+                                        bg=WIN_BG, fg="#999")
+        self._details_empty.pack(pady=14)
+
+        # Edit button
+        ttk.Separator(wd).pack(fill="x")
+        eb = tk.Frame(wd, bg=WIN_BG); eb.pack(fill="x", padx=8, pady=6)
+        tk.Button(eb, text="Edit Details", command=self._open_wafer_details_dialog,
+                  font=("Segoe UI",8,"bold"), relief="raised", bd=2,
+                  bg=BLUE, fg="white", activebackground=BLUE_HOV,
+                  activeforeground="white", padx=8, pady=2,
+                  cursor="hand2").pack(fill="x")
 
         # ── Legend ────────────────────────────────────────────────────────
         lg = ttk.LabelFrame(parent, text=" Legend ", labelanchor="nw")
         lg.pack(fill="x", padx=0, pady=(0,0))
 
-        self._legend_null_lbl = None
         for colour, char, label in [
-            ("#00aa00","1",  "Selected design → Bin 1"),
-            ("#6e6e6e","X",  "Edge / drop-in die"),
-            ("#f0f0f0",".",  "Outer null area"),
-            ("#d2d2d2","x",  "Opted-out design"),
+            ("#00aa00","1",  "Selected → Bin 1"),
+            ("#6e6e6e","X",  "Edge die"),
+            ("#f0f0f0",".",  "Null area"),
+            ("#d2d2d2","x",  "Unselected"),
         ]:
             row = tk.Frame(lg, bg=WIN_BG); row.pack(fill="x", padx=8, pady=2)
             sw = tk.Canvas(row, width=22, height=16, bg=colour,
@@ -684,9 +706,48 @@ class WaferMapTool(tk.Tk):
             lbl = tk.Label(row, text=label, font=("Segoe UI",8),
                            bg=WIN_BG, fg="#555")
             lbl.pack(side="left")
-            if char == '.':
-                self._legend_null_row = (sw, lbl)
         tk.Frame(lg, bg=WIN_BG, height=4).pack()
+
+    # ── canvas scroll / zoom ──────────────────────────────────────────────
+    def _on_canvas_scroll(self, event):
+        if event.state & 0x4:
+            self._on_canvas_zoom(event)
+            return
+        if event.num == 4:
+            self.canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            self.canvas.yview_scroll(1, "units")
+        else:
+            self.canvas.yview_scroll(-1*(event.delta//120), "units")
+
+    def _on_canvas_zoom(self, event):
+        if event.num == 4 or (hasattr(event,'delta') and event.delta > 0):
+            factor = 1.15
+        else:
+            factor = 1/1.15
+
+        old_zoom = self.zoom
+        self.zoom = max(0.05, min(16.0, self.zoom * factor))
+        if abs(self.zoom - old_zoom) < 0.001:
+            return
+
+        cx = self.canvas.canvasx(event.x)
+        cy = self.canvas.canvasy(event.y)
+        ratio = self.zoom / old_zoom
+        self._schedule_redraw()
+        def _adjust():
+            sr = self.canvas.cget("scrollregion")
+            if not sr: return
+            _, _, sw, sh = map(float, sr.split())
+            new_cx = cx * ratio
+            new_cy = cy * ratio
+            vw = self.canvas.winfo_width()
+            vh = self.canvas.winfo_height()
+            fx = max(0.0, min(1.0, (new_cx - event.x) / sw))
+            fy = max(0.0, min(1.0, (new_cy - event.y) / sh))
+            self.canvas.xview_moveto(fx)
+            self.canvas.yview_moveto(fy)
+        self.after(60, _adjust)
 
     # ── bottom bar ────────────────────────────────────────────────────────
     def _build_bottom_bar(self):
@@ -727,7 +788,8 @@ class WaferMapTool(tk.Tk):
 
         self.progress = ttk.Progressbar(bar, mode="indeterminate", length=120)
 
-    def _set_status(self, msg): self.status_var.set(msg)
+    def _set_status(self, msg): 
+        self.status_var.set(msg)
 
     # ── open / load ───────────────────────────────────────────────────────
     def _open_file(self):
@@ -736,8 +798,9 @@ class WaferMapTool(tk.Tk):
             filetypes=[("Wafer map files","*.xlsx *.xls *.txt"),("Excel files","*.xlsx *.xls"),("Text files","*.txt"),("All files","*.*")])
         if not path: return
         self.filepath = path
-        self.breadcrumb.config(text=os.path.basename(path))
-        self._set_status(f"Loading  {os.path.basename(path)} …")
+        import os as _os
+        self.breadcrumb.config(text=_os.path.basename(path))
+        self._set_status(f"Loading  {_os.path.basename(path)} …")
         self.progress.pack(side="right", padx=6, pady=4)
         self.progress.start(10)
         threading.Thread(target=self._load_thread, daemon=True).start()
@@ -745,7 +808,7 @@ class WaferMapTool(tk.Tk):
     def _load_thread(self):
         t0 = time.time()
         try:
-            grid, designs, counts, sheet, fmt, null_char, source_kind, meta = \
+            grid, designs, counts, sheet, fmt, null_char, source_kind, wafer_details, meta = \
                 detect_and_parse(self.filepath)
 
             rows = len(grid)
@@ -776,19 +839,20 @@ class WaferMapTool(tk.Tk):
             }
 
             self.after(0, lambda: self._on_load_done(
-                grid, enc, sheet, fmt, null_char, source_kind, meta, designs, counts,
-                cm_rgb, cm_xlsx, rows, cols, fsize_s, elapsed,
+                grid, enc, sheet, fmt, null_char, source_kind, meta, wafer_details,
+                designs, counts, cm_rgb, cm_xlsx, rows, cols, fsize_s, elapsed,
                 fmt_labels.get(fmt, "Text Map (.txt)")))
         except Exception as e:
             import traceback
             self.after(0, lambda: self._on_load_error(str(e)+"\n"+traceback.format_exc()))
 
-    def _on_load_done(self, grid, enc, sheet, fmt, null_char, source_kind, meta, designs, counts,
-                      cm_rgb, cm_xlsx, rows, cols, fsize_s, elapsed, fmt_label):
+    def _on_load_done(self, grid, enc, sheet, fmt, null_char, source_kind, meta, wafer_details,
+                      designs, counts, cm_rgb, cm_xlsx, rows, cols, fsize_s, elapsed, fmt_label):
         self.progress.stop(); self.progress.pack_forget()
         self.grid_data=grid; self.enc=enc; self.source_sheet=sheet
         self.file_fmt=fmt; self.null_char=null_char
         self.source_kind=source_kind; self.source_meta=meta or {}
+        self.wafer_details=wafer_details
         self.designs=designs; self.design_counts=counts
         self.cm_rgb=cm_rgb; self.cm_xlsx=cm_xlsx
         self.selected_designs.clear(); self.zoom=1.0
@@ -811,9 +875,10 @@ class WaferMapTool(tk.Tk):
 
         self.breadcrumb.config(text=f"{fname}  [{sheet}]  ·  {fmt_label}")
         self._set_status(
-            f"✔  {fname}  ·  {len(designs)} designs detected  ·  {rows}×{cols}  ·  {fmt_label}")
+            f"✔  {fname}  ·  {len(designs)} designs detected  ·  {rows}×{cols}")
 
         self._populate_designs()
+        self._populate_wafer_details()
         self.export_btn.config(state="normal", bg=BLUE, fg="white")
         self.tb_export.config(state="normal", fg="#111", bg=WIN_BG, relief="flat")
         self.tb_export.bind("<Enter>",
@@ -828,36 +893,53 @@ class WaferMapTool(tk.Tk):
         self._set_status(f"Error loading file")
         messagebox.showerror("Load Error", msg)
 
+    # ── populate wafer details ────────────────────────────────────────────
+    def _populate_wafer_details(self):
+        for w in self.details_inner.winfo_children(): w.destroy()
+        
+        if not self.wafer_details:
+            self._details_empty = tk.Label(self.details_inner,
+                                            text="No wafer details found",
+                                            font=("Segoe UI",8,"italic"),
+                                            bg=WIN_BG, fg="#999")
+            self._details_empty.pack(pady=14)
+            return
+
+        for key, value in sorted(self.wafer_details.items()):
+            row = tk.Frame(self.details_inner, bg=WIN_BG)
+            row.pack(fill="x", padx=8, pady=2)
+            
+            tk.Label(row, text=key+":", font=("Segoe UI",8,"bold"),
+                     bg=WIN_BG, fg="#333", width=14, anchor="w").pack(side="left")
+            tk.Label(row, text=str(value), font=("Segoe UI",8),
+                     bg=WIN_BG, fg="#666", wraplength=200, justify="left").pack(side="left", fill="x", expand=True, padx=(4,0))
+
     # ── design list ───────────────────────────────────────────────────────
     def _populate_designs(self):
         for w in self.design_inner.winfo_children(): w.destroy()
         self.design_vars   = {}
-        self._hover_jobs   = {}   # row_id → after-job for animation
+        self._hover_jobs   = {}
 
-        # Colours used by the hover animation
-        HOV_BG   = (220, 234, 255)   # target hover bg  RGB
+        HOV_BG   = (220, 234, 255)
         NORM_BG  = tuple(int(WIN_BG.lstrip('#')[i:i+2],16) for i in (0,2,4))
         HOV_FG   = "#003070"
         NORM_FG  = "#111111"
         HOV_CNT  = "#0055cc"
         NORM_CNT = "#555555"
-        STEPS    = 6          # animation frames
-        DELAY    = 12         # ms between frames
+        STEPS    = 6
+        DELAY    = 12
 
         def _lerp_col(a, b, t):
-            """Linearly interpolate between two RGB tuples; return hex string."""
             r = int(a[0] + (b[0]-a[0])*t)
             g = int(a[1] + (b[1]-a[1])*t)
             bl= int(a[2] + (b[2]-a[2])*t)
             return f"#{r:02x}{g:02x}{bl:02x}"
 
         def _animate(row_id, row_frame, cb_widget, cnt_lbl, step, going_in):
-            """Animate one frame of the hover fade."""
             t = step / STEPS
             if not going_in:
                 t = 1.0 - t
             bg_hex = _lerp_col(NORM_BG, HOV_BG, t)
-            # left accent strip colour
             acc_hex = _lerp_col(NORM_BG, (0, 103, 192), t)
 
             try:
@@ -873,11 +955,10 @@ class WaferMapTool(tk.Tk):
                                     tuple(int(NORM_CNT.lstrip('#')[i:i+2],16) for i in (0,2,4)),
                                     tuple(int(HOV_CNT.lstrip('#')[i:i+2],16) for i in (0,2,4)),
                                     t))
-                # accent bar
                 acc_bar = row_frame._acc_bar
                 acc_bar.config(bg=acc_hex)
             except tk.TclError:
-                return   # widget was destroyed
+                return
 
             if step < STEPS:
                 job = row_frame.after(DELAY,
@@ -891,13 +972,12 @@ class WaferMapTool(tk.Tk):
             self.design_vars[design] = var
             count = self.design_counts.get(design, 0)
 
-            # Outer row with a thin left-accent bar
             row = tk.Frame(self.design_inner, bg=WIN_BG, cursor="hand2")
             row.pack(fill="x", padx=0, pady=0)
 
             acc = tk.Frame(row, width=3, bg=WIN_BG, cursor="hand2")
             acc.pack(side="left", fill="y")
-            row._acc_bar = acc   # stash reference
+            row._acc_bar = acc
 
             sw = tk.Canvas(row, width=14, height=13, bg=hex_col,
                            highlightthickness=1, highlightbackground=SEP_COL,
@@ -933,8 +1013,6 @@ class WaferMapTool(tk.Tk):
                 widget.bind("<Enter>", _enter)
                 widget.bind("<Leave>", _leave)
 
-            # Only bind click on non-checkbox widgets to avoid double-toggle
-            # (the Checkbutton handles its own click via command=)
             for widget in (row, acc, sw, cnt):
                 widget.bind("<Button-1>",
                     lambda e, v=var: [v.set(not v.get()), self._on_sel_change()])
@@ -952,11 +1030,9 @@ class WaferMapTool(tk.Tk):
         self.sel_names_var.set(", ".join(sorted(self.selected_designs)) if n else "—")
 
         en = "normal" if self.grid_data else "disabled"
-        # Bottom Export button
         self.export_btn.config(state=en,
                                 bg=BLUE if en == "normal" else WIN_BG,
                                 fg="white" if en == "normal" else "#aaaaaa")
-        # Toolbar Export button — restore hover bindings when enabled
         self.tb_export.config(state=en,
                                fg="#111" if en == "normal" else "#aaaaaa",
                                bg=WIN_BG, relief="flat")
@@ -984,7 +1060,6 @@ class WaferMapTool(tk.Tk):
 
     # ── rendering ─────────────────────────────────────────────────────────
     def _rebuild_luts(self):
-        """Build colour lookup tables for map and preview."""
         n   = len(self.designs)
         bg  = tuple(int(WIN_BG.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
         GREY = (190, 190, 190)
@@ -1145,7 +1220,6 @@ class WaferMapTool(tk.Tk):
     def _zoom_out(self):   self.zoom=max(self.zoom/1.5,.05); self._schedule_redraw()
     def _zoom_fit(self):   self.zoom=1.0; self._schedule_redraw()
 
-
     def _open_char_map_dialog(self):
         if not self.grid_data:
             messagebox.showinfo("No File", "Open a file first.")
@@ -1156,6 +1230,18 @@ class WaferMapTool(tk.Tk):
             self.char_map_designs = dlg.result['designs']
             self.char_map_special = dlg.result['special']
             self._set_status("Character mapping updated")
+
+    def _open_wafer_details_dialog(self):
+        """Open a dialog to view and edit wafer details"""
+        if not self.grid_data and not self.wafer_details:
+            messagebox.showinfo("No Details", "No wafer details found.")
+            return
+        dlg = WaferDetailsDialog(self, self.wafer_details)
+        self.wait_window(dlg)
+        if dlg.result:
+            self.wafer_details = dlg.result
+            self._populate_wafer_details()
+            self._set_status("Wafer details updated")
 
     def _map_output_char(self, cell_val):
         if cell_val == '.':
@@ -1307,6 +1393,7 @@ class WaferMapTool(tk.Tk):
             return
         self.filepath=None; self.grid_data=[]; self.enc=None
         self.source_kind='xlsx'; self.source_meta={}
+        self.wafer_details={}
         self.designs=[]; self.design_counts={}
         self.selected_designs.clear(); self.design_vars={}; self._hover_jobs={}; self.zoom=1.0; self.prev_zoom=1.0
         self.char_map_designs={}; self.char_map_special={}
@@ -1314,6 +1401,10 @@ class WaferMapTool(tk.Tk):
         self.breadcrumb.config(text="No file loaded")
         for w in self.design_inner.winfo_children(): w.destroy()
         tk.Label(self.design_inner, text="Open a file to detect designs",
+                 font=("Segoe UI",8,"italic"),
+                 bg=WIN_BG, fg="#999").pack(pady=14)
+        for w in self.details_inner.winfo_children(): w.destroy()
+        tk.Label(self.details_inner, text="No details loaded",
                  font=("Segoe UI",8,"italic"),
                  bg=WIN_BG, fg="#999").pack(pady=14)
         for k in self.stat_vars: self.stat_vars[k].set("—")
@@ -1332,6 +1423,87 @@ class WaferMapTool(tk.Tk):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  WAFER DETAILS DIALOG
+# ═══════════════════════════════════════════════════════════════════════
+class WaferDetailsDialog(tk.Toplevel):
+    def __init__(self, parent, wafer_details):
+        super().__init__(parent)
+        self.title("Edit Wafer Details")
+        self.resizable(True, True)
+        self.grab_set()
+        self.result = None
+        self.configure(bg=WIN_BG)
+        x = parent.winfo_x() + parent.winfo_width()//2 - 310
+        y = parent.winfo_y() + parent.winfo_height()//2 - 280
+        self.geometry(f"620x560+{x}+{y}")
+
+        hdr = tk.Frame(self, bg=BLUE)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="  Wafer Details",
+                 font=("Segoe UI",11,"bold"),
+                 bg=BLUE, fg="white", pady=9).pack(side="left")
+
+        body = tk.Frame(self, bg=WIN_BG)
+        body.pack(fill="both", expand=True, padx=14, pady=12)
+
+        tk.Label(body,
+                 text="Edit wafer metadata. Leave blank to remove a field.",
+                 justify="left",
+                 font=("Segoe UI",8), bg=WIN_BG, fg="#555").pack(anchor="w", pady=(0,8))
+
+        # Scrollable details editor
+        sf = tk.Frame(body, bg=WIN_BG)
+        sf.pack(fill="both", expand=True, pady=(0,10))
+        canvas = tk.Canvas(sf, bg=WIN_BG, highlightthickness=0)
+        vsb = ttk.Scrollbar(sf, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg=WIN_BG)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        canvas.create_window((0,0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        self.detail_vars = {}
+        
+        # Standard fields
+        standard_keys = ['WAFER_ID', 'LOT_ID', 'WAFER_SIZE', 'X_SIZE', 'Y_SIZE', 'FLAT_NOTCH', 'DIES', 'BIN']
+        all_keys = list(dict.fromkeys(standard_keys + list(wafer_details.keys())))
+        
+        for key in all_keys:
+            row = tk.Frame(inner, bg=WIN_BG)
+            row.pack(fill="x", pady=3)
+            tk.Label(row, text=key+":", width=14, anchor="w", bg=WIN_BG, font=("Segoe UI",9)).pack(side="left")
+            ent = tk.Entry(row, width=40, font=("Segoe UI", 9))
+            ent.pack(side="left", padx=(0,8), fill="x", expand=True)
+            ent.insert(0, wafer_details.get(key, ''))
+            self.detail_vars[key] = ent
+
+        btns = tk.Frame(body, bg=WIN_BG)
+        btns.pack(fill="x")
+
+        tk.Button(btns, text="Cancel", command=self.destroy,
+                  font=("Segoe UI",9), relief="raised", bd=2,
+                  bg=WIN_BG, padx=10, pady=4, cursor="hand2").pack(side="right", padx=(6,0))
+        tk.Button(btns, text="Save", command=self._ok,
+                  font=("Segoe UI",9,"bold"), relief="raised", bd=2,
+                  bg=BLUE, fg="white", activebackground=BLUE_HOV,
+                  activeforeground="white", padx=14, pady=4,
+                  cursor="hand2").pack(side="right")
+
+        self.bind("<Return>", lambda e: self._ok())
+        self.bind("<Escape>", lambda e: self.destroy())
+
+    def _ok(self):
+        result = {}
+        for key, ent in self.detail_vars.items():
+            value = ent.get().strip()
+            if value:
+                result[key] = value
+        self.result = result
+        self.destroy()
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  EXPORT DIALOG
 # ═══════════════════════════════════════════════════════════════════════
 class ExportDialog(tk.Toplevel):
@@ -1346,7 +1518,6 @@ class ExportDialog(tk.Toplevel):
         y = parent.winfo_y() + parent.winfo_height()//2 - 175
         self.geometry(f"420x370+{x}+{y}")
 
-        # blue header strip
         hdr = tk.Frame(self, bg=BLUE)
         hdr.pack(fill="x")
         tk.Label(hdr, text="  Export Wafer Map",
@@ -1356,7 +1527,6 @@ class ExportDialog(tk.Toplevel):
         body = tk.Frame(self, bg=WIN_BG)
         body.pack(fill="both", padx=18, pady=10)
 
-        # info box
         ib = tk.Frame(body, bg="#deeaf7", relief="solid", bd=1)
         ib.pack(fill="x", pady=(0,12))
         export_label = ', '.join(designs) if designs else 'All detected designs'
